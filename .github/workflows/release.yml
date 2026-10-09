@@ -51,6 +51,7 @@ jobs:
           $password = ConvertTo-SecureString $env:WINDOWS_CERTIFICATE_PASSWORD -AsPlainText -Force
           Import-PfxCertificate -FilePath "$env:RUNNER_TEMP\git-monitor.pfx" -CertStoreLocation Cert:\CurrentUser\My -Password $password
       - name: Build desktop installer
+        shell: bash
         env:
           GITHUB_CLIENT_ID: ${{ secrets.GH_OAUTH_CLIENT_ID }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY || '-' }}
@@ -59,7 +60,10 @@ jobs:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-        run: npm run tauri -- build --bundles ${{ matrix.bundle }}
+        run: |
+          if [ -z "$APPLE_CERTIFICATE" ]; then unset APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD; fi
+          if [ -z "$APPLE_ID" ]; then unset APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; fi
+          npm run tauri -- build --bundles ${{ matrix.bundle }}
       - name: Name Windows installer
         if: runner.os == 'Windows'
         shell: pwsh

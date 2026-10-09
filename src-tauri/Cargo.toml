@@ -1,6 +1,6 @@
 [package]
 name = "git-monitor"
-version = "0.1.0"
+version = "0.1.1"
 description = "A quiet canvas for real Git repositories"
 authors = ["git-monitor contributors"]
 edition = "2021"
