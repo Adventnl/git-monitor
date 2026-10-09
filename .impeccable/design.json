@@ -1,0 +1,31 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-10-10T00:00:00Z",
+  "title": "Design System: git-monitor",
+  "extensions": {
+    "colorMeta": {
+      "primary": { "role": "primary", "displayName": "Action Blue", "canonical": "#347bf4" },
+      "canvas": { "role": "neutral", "displayName": "Canvas", "canonical": "#f7f9fc" },
+      "changed": { "role": "status", "displayName": "Changed Coral", "canonical": "#f46d58" }
+    },
+    "shadows": [
+      { "name": "node-rest", "value": "0 5px 18px #4d65820e, 0 1px 3px #40516b12", "purpose": "Low ambient depth for repository nodes." },
+      { "name": "inspector", "value": "0 15px 42px #1833521d", "purpose": "Lift the open inspector above the canvas." }
+    ],
+    "motion": [{ "name": "node-hover", "value": "transform 0.16s ease, box-shadow 0.16s ease", "purpose": "Confirm pointer focus without moving the canvas layout." }],
+    "breakpoints": [{ "name": "compact", "value": "900px" }, { "name": "narrow", "value": "650px" }]
+  },
+  "components": [
+    { "name": "Primary Button", "kind": "button", "refersTo": "button-primary", "description": "Main action inside dialogs and the inspector.", "html": "<button class=\"ds-primary\">Commit &amp; Push</button>", "css": ".ds-primary{background:#347bf4;color:white;border:1px solid #2e73e7;border-radius:8px;padding:8px 12px;font:600 12px -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif}.ds-primary:hover{background:#246dea}.ds-primary:focus-visible{outline:2px solid #347bf4;outline-offset:2px}" },
+    { "name": "Repository Node", "kind": "card", "refersTo": "repository-node", "description": "Compact branch and status summary on the canvas.", "html": "<div class=\"ds-node\"><strong>web-app</strong><span>main</span><small>3 files changed</small></div>", "css": ".ds-node{width:170px;background:#fff;color:#182334;border-radius:10px;padding:11px;box-shadow:0 5px 18px #4d65820e,0 1px 3px #40516b12;display:flex;flex-direction:column;gap:4px;font:11px -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif}.ds-node span,.ds-node small{color:#6b7890}.ds-node:hover{box-shadow:0 8px 22px #405c8226}.ds-node:focus-visible{outline:2px solid #347bf4}" },
+    { "name": "Text Input", "kind": "input", "description": "Commit message and branch field.", "html": "<input class=\"ds-input\" placeholder=\"Commit message…\" />", "css": ".ds-input{border:1px solid #e2e7ef;background:#fff;color:#182334;border-radius:7px;padding:8px 10px;font:12px -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif}.ds-input:focus-visible{outline:2px solid #347bf4;outline-offset:2px}" }
+  ],
+  "narrative": {
+    "northStar": "Repository Artboard",
+    "overview": "A sparse connected canvas keeps many repositories scannable, with detail revealed in an inspector or dialog.",
+    "keyCharacteristics": ["Compact white nodes", "Fine blue curves", "Generous empty canvas", "Restrained status colors"],
+    "rules": [{ "name": "The Status Color Rule", "body": "Use a colored dot or file code for state; the entire node never becomes a status badge.", "section": "colors" }],
+    "dos": ["Do keep the canvas readable with dozens of repositories.", "Do show real Git state and precise operation results.", "Do keep detailed Git controls inside an inspector or dialog."],
+    "donts": ["Don't turn the default view into a dashboard of panels and metrics.", "Don't let status colors dominate the canvas."]
+  }
+}
