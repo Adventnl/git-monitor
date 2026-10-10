@@ -63,7 +63,7 @@ The application uses the operating system's sans serif stack. Repository names a
 
 ## Layout
 
-A narrow 47px rail and 43px title area frame the XYFlow canvas. Each root node connects to repositories. The right inspector is 390px wide when there is room and shrinks on narrower windows. It overlays the canvas instead of replacing it. Canvas pan, zoom, and saved node positions remain under the inspector.
+A 186px section sidebar and 43px title area frame the XYFlow canvas. The sidebar filters repositories by named section. The right inspector is 390px wide when there is room and shrinks on narrower windows. It overlays the canvas instead of replacing it. Canvas pan, zoom, and saved node positions remain under the inspector.
 
 ## Elevation & Depth
 
@@ -71,13 +71,13 @@ Nodes use a low ambient shadow with a vertical offset. The inspector and dialogs
 
 ## Shapes
 
-Compact controls use 8px corners, nodes use 10px corners, and the inspector uses 13px corners. Curved connections terminate in small blue handles.
+Compact controls use 8px corners, nodes use 10px corners, and the inspector uses 13px corners.
 
 ## Components
 
 ### Repository node
 
-A 170px summary containing only the repository name, branch, changed-file count or Clean, and a small options glyph. The root variant is 184px wide with a folder icon and repository count.
+A 170px summary containing only the repository name, branch, changed-file count or Clean, and a small options glyph. Each node represents one selected Git repository.
 
 ### Inspector
 

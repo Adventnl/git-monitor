@@ -9,23 +9,29 @@ use tauri::{AppHandle, Emitter, Manager, State};
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 struct Settings {
-    roots: Vec<String>,
+    repos: Vec<String>,
+    sections: Vec<Section>,
     layout: String,
     positions: HashMap<String, [f64; 2]>,
     viewport: [f64; 3],
-    max_depth: usize,
     grid: bool,
     auto_monitor: bool,
     appearance: String,
 }
+#[derive(Clone, Serialize, Deserialize)]
+struct Section {
+    id: String,
+    name: String,
+    paths: Vec<String>,
+}
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            roots: vec![],
+            repos: vec![],
+            sections: vec![],
             layout: "horizontal".into(),
             positions: HashMap::new(),
             viewport: [0.0, 0.0, 1.0],
-            max_depth: 32,
             grid: true,
             auto_monitor: true,
             appearance: "light".into(),
@@ -34,10 +40,12 @@ impl Default for Settings {
 }
 struct AppState {
     settings: Mutex<Settings>,
+    save_lock: Mutex<()>,
     watchers: Mutex<Vec<RecommendedWatcher>>,
     config_file: PathBuf,
 }
 fn save(state: &AppState) -> Result<(), String> {
+    let _save_guard = state.save_lock.lock().map_err(|e| e.to_string())?;
     let value = state.settings.lock().map_err(|e| e.to_string())?.clone();
     if let Some(parent) = state.config_file.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -57,7 +65,7 @@ fn watch(app: &AppHandle, state: &AppState) -> Result<(), String> {
     if !settings.auto_monitor {
         return Ok(());
     }
-    for root in settings.roots {
+    for root in settings.repos {
         let handle = app.clone();
         let mut watcher =
             notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
@@ -89,12 +97,20 @@ fn get_settings(state: State<AppState>) -> Settings {
 fn update_settings(
     app: AppHandle,
     state: State<AppState>,
-    settings: Settings,
-) -> Result<(), String> {
+    mut settings: Settings,
+) -> Result<Settings, String> {
     let renew = {
         let mut current = state.settings.lock().map_err(|e| e.to_string())?;
-        let renew =
-            current.roots != settings.roots || current.auto_monitor != settings.auto_monitor;
+        // Repository tracking is changed only by add_repos/remove_repo. A delayed
+        // viewport or preference save must never restore a removed repository.
+        settings.repos = current.repos.clone();
+        for section in &mut settings.sections {
+            section.paths.retain(|path| settings.repos.contains(path));
+        }
+        settings
+            .positions
+            .retain(|path, _| settings.repos.contains(path));
+        let renew = current.auto_monitor != settings.auto_monitor;
         *current = settings;
         renew
     };
@@ -102,21 +118,19 @@ fn update_settings(
     if renew {
         watch(&app, &state)?;
     }
-    Ok(())
+    state
+        .settings
+        .lock()
+        .map(|settings| settings.clone())
+        .map_err(|e| e.to_string())
 }
 #[tauri::command]
-fn add_root(app: AppHandle, state: State<AppState>, path: String) -> Result<Settings, String> {
-    let normalized = fs::canonicalize(&path)
-        .map_err(|e| e.to_string())?
-        .to_string_lossy()
-        .to_string();
-    if !std::path::Path::new(&normalized).is_dir() {
-        return Err("Choose a folder".into());
-    }
+fn add_repos(app: AppHandle, state: State<AppState>, paths: Vec<String>) -> Result<Settings, String> {
+    let validated = paths.iter().map(|path| git::validate_repo_root(path)).collect::<Result<Vec<_>, _>>()?;
     let value = {
         let mut s = state.settings.lock().map_err(|e| e.to_string())?;
-        if !s.roots.contains(&normalized) {
-            s.roots.push(normalized);
+        for path in validated {
+            if !s.repos.contains(&path) { s.repos.push(path); }
         }
         s.clone()
     };
@@ -125,21 +139,17 @@ fn add_root(app: AppHandle, state: State<AppState>, path: String) -> Result<Sett
     Ok(value)
 }
 #[tauri::command]
-fn remove_root(app: AppHandle, state: State<AppState>, path: String) -> Result<Settings, String> {
+fn remove_repo(app: AppHandle, state: State<AppState>, path: String) -> Result<Settings, String> {
     let value = {
         let mut s = state.settings.lock().map_err(|e| e.to_string())?;
-        s.roots.retain(|r| r != &path);
+        s.repos.retain(|r| r != &path);
+        for section in &mut s.sections { section.paths.retain(|r| r != &path); }
+        s.positions.remove(&path);
         s.clone()
     };
     save(&state)?;
     watch(&app, &state)?;
     Ok(value)
-}
-#[tauri::command]
-async fn scan_root(path: String, max_depth: usize) -> Result<Vec<git::Repo>, String> {
-    tauri::async_runtime::spawn_blocking(move || git::discover(&path, max_depth))
-        .await
-        .map_err(|e| e.to_string())?
 }
 #[tauri::command]
 async fn inspect_repo(path: String) -> Result<git::Repo, String> {
@@ -355,12 +365,23 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             let file = app.path().app_config_dir()?.join("settings.json");
-            let settings = fs::read(&file)
-                .ok()
-                .and_then(|b| serde_json::from_slice(&b).ok())
-                .unwrap_or_default();
+            let saved = fs::read(&file).ok().and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+            let mut settings: Settings = saved.as_ref().and_then(|v| serde_json::from_value(v.clone()).ok()).unwrap_or_default();
+            if settings.repos.is_empty() {
+                if let Some(roots) = saved.as_ref().and_then(|v| v.get("roots")).and_then(|v| v.as_array()) {
+                    let depth = saved.as_ref().and_then(|v| v.get("maxDepth")).and_then(|v| v.as_u64()).unwrap_or(32) as usize;
+                    for root in roots.iter().filter_map(|v| v.as_str()) {
+                        if let Ok(found) = git::discover(root, depth) {
+                            for repo in found {
+                                if !settings.repos.contains(&repo.path) { settings.repos.push(repo.path); }
+                            }
+                        }
+                    }
+                }
+            }
             let state = AppState {
                 settings: Mutex::new(settings),
+                save_lock: Mutex::new(()),
                 watchers: Mutex::new(vec![]),
                 config_file: file,
             };
@@ -371,9 +392,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_settings,
             update_settings,
-            add_root,
-            remove_root,
-            scan_root,
+            add_repos,
+            remove_repo,
             inspect_repo,
             file_diff,
             stage_files,

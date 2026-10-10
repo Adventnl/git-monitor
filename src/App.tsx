@@ -10,23 +10,24 @@ import { Folder, GitBranch, Github, MoreHorizontal, Plus, RefreshCw, Settings2, 
 
 type FileChange = { path:string; status:string; staged:boolean; unstaged:boolean };
 type Repo = { path:string; name:string; branch:string; kind:string; files:FileChange[]; ahead:number; behind:number; upstream:string|null; remote:string|null; error:string|null };
-type Settings = { roots:string[]; layout:string; positions:Record<string,[number,number]>; viewport:[number,number,number]; maxDepth:number; grid:boolean; autoMonitor:boolean; appearance:string };
+type Section = { id:string; name:string; paths:string[] };
+type Settings = { repos:string[]; sections:Section[]; layout:string; positions:Record<string,[number,number]>; viewport:[number,number,number]; grid:boolean; autoMonitor:boolean; appearance:string };
 type OpResult = { path:string; status:string; detail:string; committed:boolean; pushed:boolean };
 type TransferPreview = { scenario:string; files:string[]; commits:string[]; conflictFiles:string[]; warning:string };
 type DeviceCode = { deviceCode:string; userCode:string; verificationUri:string; expiresIn:number; interval:number };
-type NodeData = Record<string, unknown> & { title:string; subtitle:string; count?:number; root?:boolean; dirty?:boolean; ahead?:number; behind?:number; error?:string; kind?:string };
-const initialSettings:Settings = { roots:[],layout:'horizontal',positions:{},viewport:[0,0,1],maxDepth:32,grid:true,autoMonitor:true,appearance:'light' };
+type NodeData = Record<string, unknown> & { title:string; subtitle:string; count?:number; dirty?:boolean; ahead?:number; behind?:number; error?:string; kind?:string };
+const initialSettings:Settings = { repos:[],sections:[],layout:'horizontal',positions:{},viewport:[0,0,1],grid:true,autoMonitor:true,appearance:'light' };
 const errText = (e:unknown) => typeof e === 'string' ? e : e instanceof Error ? e.message : String(e);
 const nameOf = (path:string) => path.split(/[\\/]/).filter(Boolean).at(-1) || path;
 const plural = (n:number, word:string) => `${n} ${n===1?word:word==='repository'?'repositories':`${word}s`}`;
 const api = <T,>(command:string,args?:Record<string,unknown>) => invoke<T>(command,args);
 
 function CanvasNode({data}:NodeProps<Node<NodeData>>) {
-  return <div className={`canvas-node ${data.root?'root-node':'repo-node'} ${data.error?'node-error':''}`}>
+  return <div className={`canvas-node repo-node ${data.error?'node-error':''}`}>
     <Handle type="target" position={Position.Left} className="node-handle" />
-    <div className="node-icon">{data.root?<Folder size={18}/>:<Github size={17}/>}</div>
-    <div className="node-copy"><strong title={data.title}>{data.title}</strong><span>{data.root?data.subtitle:<><GitBranch size={10}/>{data.subtitle}</>}</span>
-      {!data.root&&<small className={data.error?'status-error':data.dirty?'status-dirty':'status-clean'}><i/>{data.error?'Unavailable':data.dirty?`${data.count} ${data.count===1?'file':'files'} changed`:'Clean'}{!data.dirty&&data.behind ? ` · ↓${data.behind}`:''}{!data.dirty&&data.ahead ? ` · ↑${data.ahead}`:''}</small>}
+    <div className="node-icon"><Github size={17}/></div>
+    <div className="node-copy"><strong title={data.title}>{data.title}</strong><span><GitBranch size={10}/>{data.subtitle}</span>
+      <small className={data.error?'status-error':data.dirty?'status-dirty':'status-clean'}><i/>{data.error?'Unavailable':data.dirty?`${data.count} ${data.count===1?'file':'files'} changed`:'Clean'}{!data.dirty&&data.behind ? ` · ↓${data.behind}`:''}{!data.dirty&&data.ahead ? ` · ↑${data.ahead}`:''}</small>
     </div>
     <MoreHorizontal size={14} className="node-more"/>
     <Handle type="source" position={Position.Right} className="node-handle" />
@@ -40,9 +41,9 @@ export default function App() {
   const [nodes,setNodes]=useState<Node<NodeData>[]>([]);
   const [selected,setSelected]=useState<string|null>(null);
   const [selectedPaths,setSelectedPaths]=useState<string[]>([]);
-  const [selectedRoot,setSelectedRoot]=useState<string|null>(null);
+  const [activeSection,setActiveSection]=useState<string|null>(null);
   const [menu,setMenu]=useState(false);
-  const [modal,setModal]=useState<'bulk'|'settings'|'transfer'|'pr'|null>(null);
+  const [modal,setModal]=useState<'bulk'|'settings'|'sections'|'transfer'|'pr'|null>(null);
   const [bulkAction,setBulkAction]=useState<'commit_push'|'fetch'|'pull'>('commit_push');
   const [toast,setToast]=useState<string|null>(null);
   const [loading,setLoading]=useState(false);
@@ -50,82 +51,105 @@ export default function App() {
   const [searchOpen,setSearchOpen]=useState(false);
   const [progress,setProgress]=useState<{index:number;total:number}|null>(null);
   const [results,setResults]=useState<OpResult[]|null>(null);
+  const [settingsLoaded,setSettingsLoaded]=useState(false);
+  const [flowReady,setFlowReady]=useState(false);
   const flow=useRef<ReactFlowInstance<Node<NodeData>,Edge>|null>(null);
+  const flowWrap=useRef<HTMLDivElement|null>(null);
+  const canvasReady=useRef(false);
+  const refreshGeneration=useRef(0);
+  const trackingGeneration=useRef(0);
   const settingsRef=useRef(settings); settingsRef.current=settings;
   const reposRef=useRef(repos); reposRef.current=repos;
   const notify=(message:string)=>{setToast(message);window.setTimeout(()=>setToast(null),6500)};
-  const saveSettings=async (next:Settings)=>{setSettings(next);settingsRef.current=next;try{await api('update_settings',{settings:next})}catch(e){notify(errText(e))}};
-  const refreshRepo=useCallback(async (path:string)=>{try{const r=await api<Repo>('inspect_repo',{path});setRepos(prev=>prev.map(item=>item.path===path?r:item))}catch(e){setRepos(prev=>prev.map(item=>item.path===path?{...item,error:errText(e)}:item))}},[]);
-  const refreshAll=useCallback(async (roots?:string[])=>{
-    const paths=roots||settingsRef.current.roots;
+  const saveSettings=async (next:Settings)=>{const generation=trackingGeneration.current;try{const saved=await api<Settings>('update_settings',{settings:next});if(generation===trackingGeneration.current){setSettings(saved);settingsRef.current=saved}}catch(e){notify(errText(e))}};
+  const refreshRepo=useCallback(async (path:string)=>{try{const r=await api<Repo>('inspect_repo',{path});if(settingsRef.current.repos.includes(path))setRepos(prev=>prev.map(item=>item.path===path?r:item))}catch(e){if(settingsRef.current.repos.includes(path))setRepos(prev=>prev.map(item=>item.path===path?{...item,error:errText(e)}:item))}},[]);
+  const refreshAll=useCallback(async (paths?:string[])=>{
+    const generation=++refreshGeneration.current;
+    const targets=paths||settingsRef.current.repos;
     setLoading(true);
-    const found=await Promise.all(paths.map(async path=>{try{return await api<Repo[]>('scan_root',{path,maxDepth:settingsRef.current.maxDepth})}catch(e){notify(`${nameOf(path)}: ${errText(e)}`);return []}}));
-    setRepos(found.flat());setLoading(false);
-    if(!Object.keys(settingsRef.current.positions).length)window.setTimeout(()=>flow.current?.fitView({padding:0.25,maxZoom:1,duration:250}),140);
+    const found=await Promise.all(targets.map(async path=>{try{return await api<Repo>('inspect_repo',{path})}catch(e){return {path,name:nameOf(path),branch:'—',kind:'repository',files:[],ahead:0,behind:0,upstream:null,remote:null,error:errText(e)} as Repo}}));
+    if(generation!==refreshGeneration.current)return;
+    setRepos(found.filter(repo=>settingsRef.current.repos.includes(repo.path)));setLoading(false);
   },[]);
-  useEffect(()=>{api<Settings>('get_settings').then(s=>{setSettings(s);settingsRef.current=s;refreshAll(s.roots);if(s.viewport[2]>0)window.setTimeout(()=>flow.current?.setViewport({x:s.viewport[0],y:s.viewport[1],zoom:s.viewport[2]}),250)}).catch(e=>notify(errText(e)))},[refreshAll]);
-  useEffect(()=>{let a:(()=>void)|undefined,b:(()=>void)|undefined;let timer:number|undefined;const pending=new Set<string>();
-    listen<string>('git-changed',e=>{pending.add(e.payload);window.clearTimeout(timer);timer=window.setTimeout(()=>{const changed=[...pending];pending.clear();const paths=new Set<string>();let rescan=false;for(const path of changed){const found=reposRef.current.filter(r=>path===r.path||path.startsWith(r.path+'/')||path.startsWith(r.path+'\\'));if(found.length)found.forEach(r=>paths.add(r.path));else rescan=true}if(rescan)refreshAll();else paths.forEach(refreshRepo)},500)}).then(fn=>a=fn);
+  useEffect(()=>{if(!('__TAURI_INTERNALS__' in window))return;api<Settings>('get_settings').then(s=>{setSettings(s);settingsRef.current=s;setSettingsLoaded(true);refreshAll(s.repos)}).catch(e=>notify(errText(e)))},[refreshAll]);
+  useEffect(()=>{if(!('__TAURI_INTERNALS__' in window))return;let a:(()=>void)|undefined,b:(()=>void)|undefined;let timer:number|undefined;const pending=new Set<string>();
+    listen<string>('git-changed',e=>{pending.add(e.payload);window.clearTimeout(timer);timer=window.setTimeout(()=>{const changed=[...pending];pending.clear();const paths=new Set<string>();for(const path of changed){reposRef.current.filter(r=>path===r.path||path.startsWith(r.path+'/')||path.startsWith(r.path+'\\')).forEach(r=>paths.add(r.path))}paths.forEach(refreshRepo)},500)}).then(fn=>a=fn);
     listen<{index:number;total:number}>('bulk-progress',e=>setProgress({index:e.payload.index,total:e.payload.total})).then(fn=>b=fn);
     return()=>{a?.();b?.();window.clearTimeout(timer)};
-  },[refreshRepo,refreshAll]);
-  const addFolder=async()=>{try{const path=await chooseFolder({directory:true,multiple:false,title:'Choose a folder to monitor'});if(typeof path!=='string')return;const s=await api<Settings>('add_root',{path});setSettings(s);settingsRef.current=s;await refreshAll(s.roots)}catch(e){notify(errText(e))}};
-  const removeFolder=async(path:string)=>{try{const s=await api<Settings>('remove_root',{path});setSettings(s);settingsRef.current=s;setSelectedRoot(null);await refreshAll(s.roots)}catch(e){notify(errText(e))}};
-  const autoLayout=useCallback((layout=settingsRef.current.layout, currentRepos=reposRef.current, roots=settingsRef.current.roots)=>{
-    const positions:Record<string,[number,number]>={};
-    roots.forEach((root,ri)=>{
-      const group=currentRepos.filter(r=>r.path===root||r.path.startsWith(root+'/')||r.path.startsWith(root+'\\'));
-      const centerY=ri* Math.max(460,Math.ceil(group.length/5)*410);
-      positions[`root:${root}`]=[layout==='radial'?420:360,centerY+Math.max(0,group.length-1)*38];
-      group.forEach((repo,i)=>{
-        if(layout==='radial') {const angle=(i/group.length)*Math.PI*2;positions[repo.path]=[650+Math.cos(angle)*300,centerY+220+Math.sin(angle)*190]}
-        else if(layout==='tree') {positions[repo.path]=[620+(i%3)*215,centerY+Math.floor(i/3)*94]}
-        else {const col=Math.floor(i/8),row=i%8;positions[repo.path]=[650+col*240,centerY+row*92]}
-      });
-    });
-    saveSettings({...settingsRef.current,layout,positions});
-    window.setTimeout(()=>flow.current?.fitView({padding:0.2,duration:350,maxZoom:1}),120);
-  },[]);
+  },[refreshRepo]);
+  const addPaths=async(paths:string[])=>{const added:string[]=[];const errors:string[]=[];for(const path of paths){try{const s=await api<Settings>('add_repos',{paths:[path]});trackingGeneration.current++;setSettings(s);settingsRef.current=s;added.push(path)}catch(e){errors.push(`${nameOf(path)}: ${errText(e)}`)}}if(added.length)await refreshAll();if(errors.length)notify(errors.join(' · '));else if(added.length)notify(`${plural(added.length,'repository')} added`)};
+  const addRepos=async()=>{try{const chosen=await chooseFolder({directory:true,multiple:true,title:'Select Git repository folders'});if(!chosen)return;await addPaths(Array.isArray(chosen)?chosen:[chosen])}catch(e){notify(errText(e))}};
+  const removeRepo=async(path:string)=>{try{const s=await api<Settings>('remove_repo',{path});trackingGeneration.current++;refreshGeneration.current++;setSettings(s);settingsRef.current=s;setRepos(prev=>prev.filter(repo=>repo.path!==path));setLoading(false);setSelected(v=>v===path?null:v);setSelectedPaths(v=>v.filter(p=>p!==path));notify(`${nameOf(path)} is no longer tracked`)}catch(e){notify(errText(e))}};
+  const sectionFor=(path:string)=>settings.sections.find(section=>section.paths.includes(path));
+  useEffect(()=>{if(activeSection&&activeSection!=='ungrouped'&&!settings.sections.some(s=>s.id===activeSection))setActiveSection(null)},[activeSection,settings.sections]);
+  const visibleRepos=useMemo(()=>activeSection===null?repos:activeSection==='ungrouped'?repos.filter(r=>!settings.sections.some(s=>s.paths.includes(r.path))):repos.filter(r=>settings.sections.find(s=>s.id===activeSection)?.paths.includes(r.path)),[repos,settings.sections,activeSection]);
+  const canvasPosition=(path:string,index:number,positions=settingsRef.current.positions):[number,number]=>positions[path]||[230+(index%4)*220,180+Math.floor(index/4)*105];
+  const fitCanvas=(items=visibleRepos,positions=settingsRef.current.positions,duration=250)=>{
+    const element=flowWrap.current;
+    if(!flow.current||!element||!items.length||!element.clientWidth||!element.clientHeight)return;
+    const points=items.map((repo,index)=>canvasPosition(repo.path,index,positions));
+    const left=Math.min(...points.map(p=>p[0]));
+    const top=Math.min(...points.map(p=>p[1]));
+    const right=Math.max(...points.map(p=>p[0]+170));
+    const bottom=Math.max(...points.map(p=>p[1]+90));
+    const padding=48;
+    const zoom=Math.min(1,Math.max(0.05,Math.min((element.clientWidth-padding*2)/(right-left),(element.clientHeight-padding*2)/(bottom-top))));
+    flow.current.setViewport({x:(element.clientWidth-(left+right)*zoom)/2,y:(element.clientHeight-(top+bottom)*zoom)/2,zoom},{duration});
+  };
   useEffect(()=>{
-    const s=settingsRef.current;
-    const generated:Node<NodeData>[]=[];
-    s.roots.forEach((root,ri)=>{
-      const group=repos.filter(r=>r.path===root||r.path.startsWith(root+'/')||r.path.startsWith(root+'\\'));
-      const rootKey=`root:${root}`;
-      const rootPos=s.positions[rootKey]||[360,ri*500+Math.max(0,group.length-1)*38];
-      generated.push({id:rootKey,type:'canvas',position:{x:rootPos[0],y:rootPos[1]},data:{title:nameOf(root),subtitle:plural(group.length,'repository'),root:true},selected:selectedRoot===root});
-      group.forEach((repo,i)=>{const pos=s.positions[repo.path]||[650+Math.floor(i/8)*240,ri*500+(i%8)*92];generated.push({id:repo.path,type:'canvas',position:{x:pos[0],y:pos[1]},data:{title:repo.name,subtitle:repo.branch,count:repo.files.length,dirty:repo.files.length>0,ahead:repo.ahead,behind:repo.behind,error:repo.error||undefined,kind:repo.kind},selected:selected===repo.path||selectedPaths.includes(repo.path)})});
+    if(!settingsLoaded||!flowReady||!visibleRepos.length||canvasReady.current)return;
+    const frame=requestAnimationFrame(()=>{
+      const element=flowWrap.current;
+      if(!element)return;
+      const [x,y,zoom]=settingsRef.current.viewport;
+      const valid=[x,y,zoom].every(Number.isFinite)&&zoom>=0.05&&zoom<=1.6;
+      const inView=valid&&visibleRepos.some((repo,index)=>{
+        const [px,py]=canvasPosition(repo.path,index);
+        return px*zoom+x<element.clientWidth&&((px+170)*zoom+x)>0&&py*zoom+y<element.clientHeight&&((py+90)*zoom+y)>0;
+      });
+      canvasReady.current=true;
+      if(inView)flow.current?.setViewport({x,y,zoom});
+      else fitCanvas(visibleRepos,settingsRef.current.positions,0);
     });
-    setNodes(generated);
-  },[repos,settings.roots,settings.positions,selected,selectedRoot,selectedPaths]);
-  const edges=useMemo<Edge[]>(()=>settings.roots.flatMap(root=>repos.filter(r=>r.path===root||r.path.startsWith(root+'/')||r.path.startsWith(root+'\\')).map(r=>({id:`${root}-${r.path}`,source:`root:${root}`,target:r.path,type:'default',style:{stroke:'#8bb5fa',strokeWidth:1.25},animated:false}))),[repos,settings.roots]);
+    return()=>cancelAnimationFrame(frame);
+  },[settingsLoaded,flowReady,visibleRepos]);
+  useEffect(()=>{
+    if(!canvasReady.current||!visibleRepos.length)return;
+    const frame=requestAnimationFrame(()=>fitCanvas(visibleRepos,settingsRef.current.positions,250));
+    return()=>cancelAnimationFrame(frame);
+  },[activeSection]);
+  const autoLayout=useCallback((layout=settingsRef.current.layout, currentRepos=reposRef.current)=>{
+    const positions:Record<string,[number,number]>={};
+    currentRepos.forEach((repo,i)=>{if(layout==='radial'){const angle=(i/Math.max(currentRepos.length,1))*Math.PI*2;positions[repo.path]=[550+Math.cos(angle)*310,320+Math.sin(angle)*220]}else if(layout==='tree'){positions[repo.path]=[220+(i%4)*220,180+Math.floor(i/4)*105]}else{positions[repo.path]=[230+(i%4)*220,180+Math.floor(i/4)*105]}});
+    saveSettings({...settingsRef.current,layout,positions});window.setTimeout(()=>fitCanvas(currentRepos,positions,350),120);
+  },[]);
+  useEffect(()=>{setNodes(visibleRepos.map((repo,i)=>{const pos=settings.positions[repo.path]||[230+(i%4)*220,180+Math.floor(i/4)*105];return {id:repo.path,type:'canvas',position:{x:pos[0],y:pos[1]},data:{title:repo.name,subtitle:repo.branch,count:repo.files.length,dirty:repo.files.length>0,ahead:repo.ahead,behind:repo.behind,error:repo.error||undefined,kind:repo.kind},selected:selected===repo.path||selectedPaths.includes(repo.path)}}))},[visibleRepos,settings.positions,selected,selectedPaths]);
+  const edges=useMemo<Edge[]>(()=>[],[]);
   const onNodesChange=(changes:NodeChange<Node<NodeData>>[])=>setNodes(prev=>applyNodeChanges(changes,prev));
+  const onSelectionChange=useCallback(({nodes:chosen}:{nodes:Node<NodeData>[]})=>{const next=chosen.map(n=>n.id);setSelectedPaths(old=>old.length===next.length&&old.every((path,i)=>path===next[i])?old:next)},[]);
   const persistPositions=()=>{const positions={...settingsRef.current.positions};nodes.forEach(n=>positions[n.id]=[n.position.x,n.position.y]);saveSettings({...settingsRef.current,positions})};
   const activeRepo=repos.find(r=>r.path===selected)||null;
-  const rootRepos=selectedRoot?repos.filter(r=>r.path===selectedRoot||r.path.startsWith(selectedRoot+'/')||r.path.startsWith(selectedRoot+'\\')):repos;
-  const scopedRepos=selectedPaths.length?rootRepos.filter(r=>selectedPaths.includes(r.path)):rootRepos;
+  const scopedRepos=useMemo(()=>selectedPaths.length?visibleRepos.filter(r=>selectedPaths.includes(r.path)):visibleRepos,[selectedPaths,visibleRepos]);
   const launchBulk=(action:'commit_push'|'fetch'|'pull')=>{setBulkAction(action);setResults(null);setProgress(null);setModal('bulk');setMenu(false)};
-  useEffect(()=>{const onKey=(e:KeyboardEvent)=>{const mod=e.metaKey||e.ctrlKey;if(e.key==='Escape'){setModal(null);setSelected(null);setSelectedRoot(null);setMenu(false);setSearchOpen(false)}if(mod&&e.key.toLowerCase()==='o'){e.preventDefault();addFolder()}if(mod&&e.key.toLowerCase()==='r'){e.preventDefault();refreshAll()}if(mod&&e.key.toLowerCase()==='f'){e.preventDefault();setSearchOpen(true)}if(mod&&(e.key==='+'||e.key==='=')){e.preventDefault();flow.current?.zoomIn()}if(mod&&e.key==='-'){e.preventDefault();flow.current?.zoomOut()}};window.addEventListener('keydown',onKey);return()=>window.removeEventListener('keydown',onKey)},[refreshAll]);
-  useEffect(()=>{let unlisten:(()=>void)|undefined;getCurrentWindow().onDragDropEvent(async event=>{
-    if(event.payload.type!=='drop')return;
-    for(const path of event.payload.paths){try{const s=await api<Settings>('add_root',{path});setSettings(s);settingsRef.current=s}catch(e){notify(`${nameOf(path)}: ${errText(e)}`)}}
-    refreshAll();
-  }).then(fn=>unlisten=fn);return()=>unlisten?.()},[refreshAll]);
+  const selectSection=(id:string|null)=>{setActiveSection(id);setSelected(null);setSelectedPaths([])};
+  useEffect(()=>{const onKey=(e:KeyboardEvent)=>{const mod=e.metaKey||e.ctrlKey;if(e.key==='Escape'){setModal(null);setSelected(null);setMenu(false);setSearchOpen(false)}if(mod&&e.key.toLowerCase()==='o'){e.preventDefault();addRepos()}if(mod&&e.key.toLowerCase()==='r'){e.preventDefault();refreshAll()}if(mod&&e.key.toLowerCase()==='f'){e.preventDefault();setSearchOpen(true)}if(mod&&(e.key==='+'||e.key==='=')){e.preventDefault();flow.current?.zoomIn()}if(mod&&e.key==='-'){e.preventDefault();flow.current?.zoomOut()}};window.addEventListener('keydown',onKey);return()=>window.removeEventListener('keydown',onKey)},[refreshAll]);
+  useEffect(()=>{if(!('__TAURI_INTERNALS__' in window))return;let unlisten:(()=>void)|undefined;getCurrentWindow().onDragDropEvent(async event=>{if(event.payload.type==='drop')await addPaths(event.payload.paths)}).then(fn=>unlisten=fn);return()=>unlisten?.()},[refreshAll]);
+  const ungrouped=repos.filter(r=>!settings.sections.some(s=>s.paths.includes(r.path)));
   return <main className={`app theme-${settings.appearance} ${navigator.userAgent.includes('Mac')?'mac':''}`}>
     <header className="titlebar" data-tauri-drag-region><div className="brand" data-tauri-drag-region><span className="brand-mark"><GitBranch size={13}/></span><span data-tauri-drag-region>git-monitor</span></div><button className="icon-button search-button" aria-label="Search repositories" onClick={()=>setSearchOpen(true)}><Search size={15}/></button><div className="titlebar-spacer" data-tauri-drag-region/></header>
-    <aside className="rail"><button className="rail-button active" aria-label="Canvas" onClick={()=>{setSelected(null);setSelectedRoot(null)}}><span className="rail-canvas"/></button><button className="rail-button" aria-label="Add folder" onClick={addFolder}><Plus size={19}/></button><span className="rail-spacer"/><button className="rail-button" aria-label="Settings" onClick={()=>setModal('settings')}><Settings2 size={17}/></button></aside>
-    {settings.roots.length===0?<section className="first-run"><div className="first-run-icon"><Folder size={23}/></div><h1>Your repositories, in view.</h1><p>Choose a folder and git-monitor will find its Git repositories.</p><button className="primary-button" onClick={addFolder}><Plus size={15}/> Add Folder</button></section>:<>
-      <div className="breadcrumb"><Folder size={14}/><button onClick={()=>setSelectedRoot(settings.roots[0])}>{settings.roots.length===1?nameOf(settings.roots[0]):`${settings.roots.length} folders`}</button><button className="crumb-add" aria-label="Add folder" onClick={addFolder}><Plus size={14}/></button></div>
-      <div className="top-actions">{selectedPaths.length>0&&<span className="selection-count">{plural(selectedPaths.length,'selected')}</span>}<button className="round-action" aria-label="Refresh all" title="Refresh all" onClick={()=>refreshAll()}><RefreshCw size={15} className={loading?'spin':''}/></button><button className="commit-all" onClick={()=>launchBulk('commit_push')}><ArrowUp size={15}/> {selectedPaths.length?'Commit & Push Selected':'Commit & Push All'}</button><div className="menu-wrap"><button className="round-action" aria-label="More actions" onClick={()=>setMenu(!menu)}><MoreHorizontal size={19}/></button>{menu&&<div className="action-menu">
-        <button onClick={()=>launchBulk('commit_push')}>Commit & Push {selectedPaths.length?'Selected':'All'}</button><button onClick={()=>launchBulk('fetch')}>Fetch {selectedPaths.length?'Selected':'All'}</button><button onClick={()=>launchBulk('pull')}>Pull {selectedPaths.length?'Selected':'All'}</button><hr/><button onClick={()=>{setSelectedPaths(repos.map(r=>r.path));setMenu(false)}}>Select all</button><button onClick={()=>{setSelectedPaths(repos.filter(r=>r.files.length).map(r=>r.path));setMenu(false)}}>Select changed</button><button onClick={()=>{setSelectedPaths([]);setMenu(false)}}>Deselect all</button><hr/><button onClick={()=>{refreshAll();setMenu(false)}}>Refresh All</button><button onClick={()=>{autoLayout();setMenu(false)}}>Auto Layout</button><button onClick={()=>{flow.current?.fitView({padding:0.2,duration:300});setMenu(false)}}>Fit Canvas</button><hr/><button onClick={()=>{setModal('settings');setMenu(false)}}>Settings</button>
+    <aside className="section-sidebar" aria-label="Repository sections"><div className="sidebar-heading"><span>Sections</span><button aria-label="Manage sections" title="Manage sections" onClick={()=>setModal('sections')}><Plus size={15}/></button></div><button className={`sidebar-section ${activeSection===null?'current':''}`} onClick={()=>selectSection(null)}><span>All repositories</span><small>{repos.length}</small></button>{settings.sections.map(section=><button key={section.id} className={`sidebar-section ${activeSection===section.id?'current':''}`} onClick={()=>selectSection(section.id)}><span>{section.name}</span><small>{section.paths.filter(p=>settings.repos.includes(p)).length}</small></button>)}{settings.sections.length>0&&ungrouped.length>0&&<button className={`sidebar-section ${activeSection==='ungrouped'?'current':''}`} onClick={()=>selectSection('ungrouped')}><span>Ungrouped</span><small>{ungrouped.length}</small></button>}<button className="sidebar-add" onClick={addRepos}><Plus size={15}/> Add repositories</button><div className="sidebar-bottom"><button onClick={()=>setModal('sections')}><Folder size={15}/> Organize</button><button onClick={()=>setModal('settings')}><Settings2 size={15}/> Settings</button></div></aside>
+    {settings.repos.length===0?<section className="first-run"><div className="first-run-icon"><Github size={23}/></div><h1>Your repositories, in view.</h1><p>Select one or several Git repository folders to start monitoring.</p><button className="primary-button" onClick={addRepos}><Plus size={15}/> Add repositories</button></section>:<>
+      <div className="breadcrumb"><Github size={14}/><span>{activeSection===null?'All repositories':activeSection==='ungrouped'?'Ungrouped':settings.sections.find(s=>s.id===activeSection)?.name}</span><span className="breadcrumb-count">{plural(visibleRepos.length,'repository')}</span></div>
+      <div className="top-actions">{selectedPaths.length>0&&<span className="selection-count">{plural(selectedPaths.length,'selected')}</span>}<button className="round-action" aria-label="Refresh visible repositories" title="Refresh" onClick={()=>refreshAll()}><RefreshCw size={15} className={loading?'spin':''}/></button><button className="commit-all" onClick={()=>launchBulk('commit_push')}><ArrowUp size={15}/> {selectedPaths.length?'Commit & Push Selected':'Commit & Push All'}</button><div className="menu-wrap"><button className="round-action" aria-label="More actions" onClick={()=>setMenu(!menu)}><MoreHorizontal size={19}/></button>{menu&&<div className="action-menu">
+        <button onClick={()=>launchBulk('commit_push')}>Commit & Push {selectedPaths.length?'Selected':'All'}</button><button onClick={()=>launchBulk('fetch')}>Fetch {selectedPaths.length?'Selected':'All'}</button><button onClick={()=>launchBulk('pull')}>Pull {selectedPaths.length?'Selected':'All'}</button><hr/><button onClick={()=>{setSelectedPaths(visibleRepos.map(r=>r.path));setMenu(false)}}>Select all visible</button><button onClick={()=>{setSelectedPaths(visibleRepos.filter(r=>r.files.length).map(r=>r.path));setMenu(false)}}>Select changed</button><button onClick={()=>{setSelectedPaths([]);setMenu(false)}}>Deselect all</button><hr/><button onClick={()=>{setModal('sections');setMenu(false)}}>Organize sections</button><button onClick={()=>{addRepos();setMenu(false)}}>Add repositories</button><button onClick={()=>{autoLayout();setMenu(false)}}>Auto Layout</button><button onClick={()=>{fitCanvas();setMenu(false)}}>Fit Canvas</button><hr/><button onClick={()=>{setModal('settings');setMenu(false)}}>Settings</button>
       </div>}</div></div>
-      <div className="flow-wrap"><ReactFlow nodes={nodes} edges={edges} nodeTypes={nodeTypes} onInit={i=>{flow.current=i; if(settingsRef.current.viewport[2]===1) i.fitView({padding:0.3,maxZoom:1})}} onNodesChange={onNodesChange} onNodeDragStop={persistPositions} onSelectionChange={({nodes:chosen})=>{const next=chosen.filter(n=>!n.id.startsWith('root:')).map(n=>n.id);setSelectedPaths(old=>old.join('|')===next.join('|')?old:next)}} onNodeClick={(_,n)=>{if(n.id.startsWith('root:')){setSelectedRoot(n.id.slice(5));setSelected(null)}else{setSelected(n.id);setSelectedRoot(null)}}} onPaneClick={()=>{setSelected(null);setSelectedRoot(null);setSelectedPaths([])}} onMoveEnd={(_,v)=>{const old=settingsRef.current;if(Math.abs(old.viewport[0]-v.x)>1||Math.abs(old.viewport[1]-v.y)>1||Math.abs(old.viewport[2]-v.zoom)>.01)saveSettings({...old,viewport:[v.x,v.y,v.zoom]})}} fitView proOptions={{hideAttribution:true}} minZoom={0.25} maxZoom={1.6} selectionOnDrag multiSelectionKeyCode="Shift" panOnDrag><Background variant={BackgroundVariant.Dots} gap={18} size={0.7} color={settings.grid?'#dde4ee':'transparent'}/><Controls showInteractive={false} className="canvas-controls"/></ReactFlow></div>
+      <div className="flow-wrap" ref={flowWrap}><span style={{position:"absolute",top:100,left:100,zIndex:100,background:"white"}}>debug nodes {nodes.length} flow {flow.current?.getNodes().length} ready {String(canvasReady.current)}</span><ReactFlow nodes={nodes} edges={edges} nodeTypes={nodeTypes} onInit={i=>{flow.current=i;setFlowReady(true)}} onNodesChange={onNodesChange} onNodeDragStop={persistPositions} onSelectionChange={onSelectionChange} onNodeClick={(_,n)=>setSelected(n.id)} onPaneClick={()=>{setSelected(null);setSelectedPaths([])}} onMoveEnd={(_,v)=>{if(!canvasReady.current)return;const old=settingsRef.current;if(Math.abs(old.viewport[0]-v.x)>1||Math.abs(old.viewport[1]-v.y)>1||Math.abs(old.viewport[2]-v.zoom)>.01)saveSettings({...old,viewport:[v.x,v.y,v.zoom]})}} proOptions={{hideAttribution:true}} minZoom={0.05} maxZoom={1.6} selectionOnDrag multiSelectionKeyCode="Shift" panOnDrag><Background variant={BackgroundVariant.Dots} gap={18} size={0.7} color={settings.grid?'#dde4ee':'transparent'}/><Controls showInteractive={false} onFitView={()=>fitCanvas()} className="canvas-controls"/></ReactFlow>{visibleRepos.length===0&&<div className="section-empty"><Folder size={22}/><strong>No repositories in this section</strong><span>Use Organize to add repositories here.</span><button className="secondary-button" onClick={()=>setModal('sections')}>Organize repositories</button></div>}</div>
     </>}
-    {activeRepo&&<Inspector repo={activeRepo} refresh={()=>refreshRepo(activeRepo.path)} close={()=>setSelected(null)} notify={notify} openTransfer={()=>{setModal('transfer')}} openPr={()=>setModal('pr')}/>}
-    {selectedRoot&&<div className="root-popover"><button className="close" aria-label="Close" onClick={()=>setSelectedRoot(null)}><X size={16}/></button><div className="popover-heading"><Folder size={20}/><div><strong>{nameOf(selectedRoot)}</strong><span>{plural(rootRepos.length,'repository')}</span></div></div><div className="root-actions"><button onClick={()=>launchBulk('commit_push')}><ArrowUp size={15}/> Commit & Push All</button><button onClick={()=>launchBulk('fetch')}><ArrowDown size={15}/> Fetch All</button><button onClick={()=>launchBulk('pull')}><GitBranch size={15}/> Pull All</button><button onClick={()=>refreshAll()}><RefreshCw size={15}/> Refresh</button></div><button className="remove-root" onClick={()=>removeFolder(selectedRoot)}>Remove monitored folder</button></div>}
-    {searchOpen&&<div className="search-overlay"><div className="search-dialog"><div className="search-input"><Search size={17}/><input autoFocus placeholder="Find a repository…" value={search} onChange={e=>setSearch(e.target.value)}/><button onClick={()=>setSearchOpen(false)}><X size={15}/></button></div><div className="search-results">{repos.filter(r=>r.name.toLowerCase().includes(search.toLowerCase())).slice(0,30).map(r=><button key={r.path} onClick={()=>{setSelected(r.path);setSearchOpen(false);flow.current?.setCenter(settings.positions[r.path]?.[0]||700,settings.positions[r.path]?.[1]||300,{zoom:1,duration:300})}}><Github size={15}/><span>{r.name}</span><small>{r.branch}</small></button>)}</div></div></div>}
+    {activeRepo&&<Inspector repo={activeRepo} refresh={()=>refreshRepo(activeRepo.path)} close={()=>setSelected(null)} remove={()=>removeRepo(activeRepo.path)} notify={notify} openTransfer={()=>{setModal('transfer')}} openPr={()=>setModal('pr')}/>}
+    {searchOpen&&<div className="search-overlay"><div className="search-dialog"><div className="search-input"><Search size={17}/><input autoFocus placeholder="Find a repository…" value={search} onChange={e=>setSearch(e.target.value)}/><button onClick={()=>setSearchOpen(false)}><X size={15}/></button></div><div className="search-results">{repos.filter(r=>r.name.toLowerCase().includes(search.toLowerCase())).slice(0,30).map(r=><button key={r.path} onClick={()=>{selectSection(null);setSelected(r.path);setSearchOpen(false);flow.current?.setCenter(settings.positions[r.path]?.[0]||230,settings.positions[r.path]?.[1]||180,{zoom:1,duration:300})}}><Github size={15}/><span>{r.name}</span><small>{sectionFor(r.path)?.name||'Ungrouped'}</small></button>)}</div></div></div>}
     {modal==='bulk'&&<BulkModal action={bulkAction} repos={scopedRepos} close={()=>setModal(null)} refresh={()=>refreshAll()} notify={notify} progress={progress} setProgress={setProgress} results={results} setResults={setResults}/>}
-    {modal==='settings'&&<SettingsModal settings={settings} save={saveSettings} close={()=>setModal(null)} addFolder={addFolder} removeFolder={removeFolder} autoLayout={autoLayout} notify={notify}/>}
+    {modal==='settings'&&<SettingsModal settings={settings} save={saveSettings} close={()=>setModal(null)} addRepos={addRepos} removeRepo={removeRepo} autoLayout={autoLayout} notify={notify}/>}
+    {modal==='sections'&&<SectionsModal settings={settings} save={saveSettings} close={()=>setModal(null)} />}
     {modal==='transfer'&&activeRepo&&<TransferModal repo={activeRepo} close={()=>setModal(null)} notify={notify} refresh={()=>refreshRepo(activeRepo.path)}/>}
     {modal==='pr'&&activeRepo&&<PrModal repo={activeRepo} close={()=>setModal(null)} notify={notify}/>}
     {toast&&<div className="toast" role="status">{toast}<button onClick={()=>setToast(null)} aria-label="Dismiss"><X size={14}/></button></div>}
@@ -134,7 +158,7 @@ export default function App() {
 
 function Diff({text}: {text:string}) {let oldLine=0,newLine=0;return <pre className="diff">{text?text.split('\n').map((line,i)=>{const hunk=line.match(/^@@ -(\d+)(?:,\d+)? \+(\d+)/);if(hunk){oldLine=Number(hunk[1]);newLine=Number(hunk[2])}const added=line.startsWith('+')&&!line.startsWith('+++'),removed=line.startsWith('-')&&!line.startsWith('---'),context=line.startsWith(' ');const oldNum=removed||context?oldLine++:'';const newNum=added||context?newLine++:'';return <div key={i} className={added?'diff-add':removed?'diff-remove':hunk?'diff-hunk':''}><span className="diff-num">{oldNum}<b>{newNum}</b></span><code>{line||' '}</code></div>}):<div className="diff-empty">No diff in this view.</div>}</pre>}
 
-function Inspector({repo,refresh,close,notify,openTransfer,openPr}:{repo:Repo;refresh:()=>void;close:()=>void;notify:(s:string)=>void;openTransfer:()=>void;openPr:()=>void}) {
+function Inspector({repo,refresh,close,remove,notify,openTransfer,openPr}:{repo:Repo;refresh:()=>void;close:()=>void;remove:()=>void;notify:(s:string)=>void;openTransfer:()=>void;openPr:()=>void}) {
   const [file,setFile]=useState<string|null>(null),[diff,setDiff]=useState(''),[stagedView,setStagedView]=useState(false),[message,setMessage]=useState(''),[mode,setMode]=useState('all'),[include,setInclude]=useState(true),[amend,setAmend]=useState(false),[busy,setBusy]=useState(false),[section,setSection]=useState<'changes'|'branches'|'history'|'prs'>('changes'),[branches,setBranches]=useState<string[]>([]),[history,setHistory]=useState<string[]>([]),[historyDiff,setHistoryDiff]=useState(''),[prs,setPrs]=useState<any[]>([]),[newBranch,setNewBranch]=useState('');
   useEffect(()=>{setFile(null);setDiff('');setSection('changes')},[repo.path]);
   useEffect(()=>{if(!file)return;api<string>('file_diff',{path:repo.path,file,staged:stagedView}).then(setDiff).catch(e=>notify(errText(e)))},[file,stagedView,repo.path,repo.files]);
@@ -142,7 +166,7 @@ function Inspector({repo,refresh,close,notify,openTransfer,openPr}:{repo:Repo;re
   const doCommit=async(push:boolean)=>{setBusy(true);try{const r=await api<OpResult>('commit_repo',{path:repo.path,message,mode,includeUntracked:include,push,amend});notify(r.detail);if(r.status==='success'){setMessage('');refresh()}}catch(e){notify(errText(e))}finally{setBusy(false)}};
   const chooseSection=(s:typeof section)=>{setSection(s);if(s==='branches')api<string[]>('list_branches',{path:repo.path}).then(setBranches).catch(e=>notify(errText(e)));if(s==='history')api<string[]>('repo_history',{path:repo.path}).then(setHistory).catch(e=>notify(errText(e)));if(s==='prs')api<any[]>('github_prs',{path:repo.path}).then(setPrs).catch(e=>notify(errText(e)))};
   const branchAction=(action:string,name:string,other?:string)=>run(async()=>{const r=await api<string>('manage_branch',{path:repo.path,action,name,other});notify(r);setBranches(await api('list_branches',{path:repo.path}))});
-  return <aside className="inspector"><div className="inspector-head"><div><small>Repository</small><h2>{repo.name}</h2><span><GitBranch size={13}/>{repo.branch}{repo.upstream&&<em> · {repo.upstream}</em>}</span></div><button aria-label="Close inspector" className="icon-button" onClick={close}><PanelRightClose size={18}/></button></div>
+  return <aside className="inspector"><div className="inspector-head"><div><small>Repository</small><h2>{repo.name}</h2><span><GitBranch size={13}/>{repo.branch}{repo.upstream&&<em> · {repo.upstream}</em>}</span></div><div className="inspector-head-actions"><button className="stop-tracking" onClick={remove} title="Remove this repository from git-monitor; files stay on disk">Stop tracking</button><button aria-label="Close inspector" className="icon-button" onClick={close}><PanelRightClose size={18}/></button></div></div>
     <div className="inspector-tabs">{(['changes','branches','history','prs'] as const).map(s=><button key={s} className={section===s?'current':''} onClick={()=>chooseSection(s)}>{s==='prs'?'PRs':s[0].toUpperCase()+s.slice(1)}</button>)}</div>
     {section==='changes'&&<><div className="section-label"><strong>{repo.files.length?plural(repo.files.length,'file')+' changed':'Working tree clean'}</strong><div><button onClick={()=>run(async()=>{await api('stage_files',{path:repo.path,files:[],all:true,includeUntracked:true})})} disabled={!repo.files.length||busy}>Stage all</button><button onClick={()=>run(async()=>{await api('unstage_files',{path:repo.path,files:[],all:true})})} disabled={!repo.files.some(f=>f.staged)||busy}>Unstage all</button></div></div>
     <div className="file-list">{repo.files.map(f=><div className={`file-row ${file===f.path?'active':''}`} key={f.path}><button className="file-open" onClick={()=>{setFile(f.path);setStagedView(false)}}><span className={`file-code code-${f.status}`}>{f.status}</span><span title={f.path}>{f.path}</span></button><button className="file-stage" title={f.staged?'Unstage':'Stage'} onClick={()=>run(async()=>{await api(f.staged?'unstage_files':'stage_files',{path:repo.path,files:[f.path],all:false,includeUntracked:true})})}>{f.staged?<Minus size={13}/>:<Plus size={13}/>}</button></div>)}{!repo.files.length&&<div className="quiet-empty"><Check size={19}/>Everything is up to date locally.</div>}</div>
@@ -167,13 +191,26 @@ function BulkModal({action,repos,close,refresh,notify,progress,setProgress,resul
     <div className="dialog-actions"><button onClick={close}>{results?'Done':'Cancel'}</button><button className="primary-button" disabled={busy||(results?!results.some(r=>r.status==='failed'):!paths.length||(action==='commit_push'&&!message.trim()))} onClick={()=>run(!!results)}>{busy?'Working…':results?'Retry failed':title}</button></div></div></div>;
 }
 
-function SettingsModal({settings,save,close,addFolder,removeFolder,autoLayout,notify}:{settings:Settings;save:(s:Settings)=>Promise<void>;close:()=>void;addFolder:()=>void;removeFolder:(s:string)=>void;autoLayout:(layout:string)=>void;notify:(s:string)=>void}) {
+function SettingsModal({settings,save,close,addRepos,removeRepo,autoLayout,notify}:{settings:Settings;save:(s:Settings)=>Promise<void>;close:()=>void;addRepos:()=>void;removeRepo:(s:string)=>void;autoLayout:(layout:string)=>void;notify:(s:string)=>void}) {
   const [gitVersion,setGitVersion]=useState('Checking…'),[connected,setConnected]=useState(false),[device,setDevice]=useState<DeviceCode|null>(null),[connecting,setConnecting]=useState(false);
   useEffect(()=>{api<string>('git_version').then(setGitVersion).catch(e=>setGitVersion(errText(e)));api<boolean>('github_connected').then(setConnected)},[]);
   const connect=async()=>{try{setConnecting(true);const code=await api<DeviceCode>('github_begin');setDevice(code);await openUrl(code.verificationUri);await api('github_finish',{code});setConnected(true);setDevice(null);notify('GitHub connected')}catch(e){notify(errText(e))}finally{setConnecting(false)}};
-  return <div className="modal-backdrop"><div className="dialog settings-dialog"><button className="close" aria-label="Close" onClick={close}><X size={16}/></button><h2>Settings</h2><div className="settings-group"><h3>Folders</h3>{settings.roots.map(r=><div className="settings-root" key={r}><Folder size={15}/><span title={r}>{r}</span><button onClick={()=>removeFolder(r)} aria-label={`Remove ${r}`}><X size={14}/></button></div>)}<button className="text-action" onClick={addFolder}><Plus size={14}/> Add folder</button></div>
-  <div className="settings-group"><h3>Canvas</h3><label>Layout<select value={settings.layout} onChange={e=>autoLayout(e.target.value)}><option value="horizontal">Horizontal</option><option value="tree">Tree</option><option value="radial">Radial</option></select></label><label>Appearance<select value={settings.appearance} onChange={e=>save({...settings,appearance:e.target.value})}><option value="light">Light</option><option value="dark">Dark</option><option value="system">System</option></select></label><label>Scan depth<input type="number" min="1" max="100" value={settings.maxDepth} onChange={e=>save({...settings,maxDepth:Number(e.target.value)})}/></label><label><input type="checkbox" checked={settings.grid} onChange={e=>save({...settings,grid:e.target.checked})}/> Show canvas dots</label><label><input type="checkbox" checked={settings.autoMonitor} onChange={e=>save({...settings,autoMonitor:e.target.checked})}/> Monitor file changes</label></div>
+  return <div className="modal-backdrop"><div className="dialog settings-dialog"><button className="close" aria-label="Close" onClick={close}><X size={16}/></button><h2>Settings</h2><div className="settings-group"><h3>Repositories</h3>{settings.repos.map(r=><div className="settings-root" key={r}><Github size={15}/><span title={r}>{r}</span><button onClick={()=>removeRepo(r)} aria-label={`Stop tracking ${nameOf(r)}`} title="Remove from git-monitor; files stay on disk">Stop tracking</button></div>)}<button className="text-action" onClick={addRepos}><Plus size={14}/> Add repositories</button></div>
+  <div className="settings-group"><h3>Canvas</h3><label>Layout<select value={settings.layout} onChange={e=>autoLayout(e.target.value)}><option value="horizontal">Horizontal</option><option value="tree">Tree</option><option value="radial">Radial</option></select></label><label>Appearance<select value={settings.appearance} onChange={e=>save({...settings,appearance:e.target.value})}><option value="light">Light</option><option value="dark">Dark</option><option value="system">System</option></select></label><label><input type="checkbox" checked={settings.grid} onChange={e=>save({...settings,grid:e.target.checked})}/> Show canvas dots</label><label><input type="checkbox" checked={settings.autoMonitor} onChange={e=>save({...settings,autoMonitor:e.target.checked})}/> Monitor file changes</label></div>
   <div className="settings-group"><h3>Integrations</h3><div className="integration-row"><span><GitBranch size={15}/> Git <small>{gitVersion}</small></span></div><div className="integration-row"><span><Github size={15}/> GitHub <small>{connected?'Connected':'Not connected'}</small></span>{connected?<button onClick={async()=>{try{await api('github_disconnect');setConnected(false)}catch(e){notify(errText(e))}}}>Disconnect</button>:<button onClick={connect} disabled={connecting}>{connecting?'Connecting…':'Connect'}</button>}</div>{device&&<p className="device-code">Enter code <strong>{device.userCode}</strong> at GitHub in your browser.</p>}</div><div className="dialog-actions"><button className="primary-button" onClick={close}>Done</button></div></div></div>;
+}
+
+function SectionsModal({settings,save,close}:{settings:Settings;save:(s:Settings)=>Promise<void>;close:()=>void}) {
+  const [name,setName]=useState('');
+  const [editing,setEditing]=useState<string|null>(settings.sections[0]?.id||null);
+  const [draft,setDraft]=useState(settings.sections[0]?.name||'');
+  const section=settings.sections.find(s=>s.id===editing);
+  const create=async()=>{const trimmed=name.trim();if(!trimmed||settings.sections.some(s=>s.name.toLowerCase()===trimmed.toLowerCase()))return;const id=crypto.randomUUID();await save({...settings,sections:[...settings.sections,{id,name:trimmed,paths:[]}]});setEditing(id);setDraft(trimmed);setName('')};
+  const update=async(next:Section[])=>{await save({...settings,sections:next})};
+  const toggle=async(path:string,checked:boolean)=>{if(!section)return;await update(settings.sections.map(s=>({...s,paths:s.id===section.id?(checked?[...s.paths,path]:s.paths.filter(p=>p!==path)):s.paths.filter(p=>p!==path)})))};
+  const rename=async()=>{if(!section)return;const trimmed=draft.trim();if(!trimmed||settings.sections.some(s=>s.id!==section.id&&s.name.toLowerCase()===trimmed.toLowerCase()))return;await update(settings.sections.map(s=>s.id===section.id?{...s,name:trimmed}:s))};
+  const remove=async()=>{if(!section)return;await update(settings.sections.filter(s=>s.id!==section.id));const remaining=settings.sections.filter(s=>s.id!==section.id);setEditing(remaining[0]?.id||null);setDraft(remaining[0]?.name||'')};
+  return <div className="modal-backdrop"><div className="dialog sections-dialog"><button className="close" aria-label="Close" onClick={close}><X size={16}/></button><h2>Organize repositories</h2><p>Create sections for related repositories, then choose which repositories belong in each one.</p><div className="section-create"><input className="dialog-input" value={name} onChange={e=>setName(e.target.value)} onKeyDown={e=>{if(e.key==='Enter')create()}} placeholder="New section name" aria-label="New section name"/><button className="primary-button" onClick={create} disabled={!name.trim()||settings.sections.some(s=>s.name.toLowerCase()===name.trim().toLowerCase())}><Plus size={14}/> Create</button></div><div className="section-editor"><div className="section-editor-list">{settings.sections.map(s=><button className={editing===s.id?'current':''} key={s.id} onClick={()=>{setEditing(s.id);setDraft(s.name)}}><Folder size={14}/><span>{s.name}</span><small>{s.paths.length}</small></button>)}{!settings.sections.length&&<p>Create your first section.</p>}</div>{section&&<div className="section-editor-main"><div className="section-name-row"><input value={draft} onChange={e=>setDraft(e.target.value)} onBlur={rename} onKeyDown={e=>{if(e.key==='Enter')rename()}} aria-label="Section name"/><button onClick={remove} title="Delete section" aria-label={`Delete ${section.name}`}><X size={15}/></button></div><div className="section-repo-list">{settings.repos.map(path=><label key={path}><input type="checkbox" checked={section.paths.includes(path)} onChange={e=>toggle(path,e.target.checked)}/><span><strong>{nameOf(path)}</strong><small title={path}>{path}</small></span></label>)}{!settings.repos.length&&<p>Add repositories to organize them.</p>}</div></div>}</div><div className="dialog-actions"><button className="primary-button" onClick={close}>Done</button></div></div></div>;
 }
 
 function TransferModal({repo,close,notify,refresh}:{repo:Repo;close:()=>void;notify:(s:string)=>void;refresh:()=>void}) {

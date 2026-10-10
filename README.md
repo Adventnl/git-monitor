@@ -4,8 +4,8 @@ A native Tauri desktop application for monitoring local Git repositories on a co
 
 ## What is implemented
 
-- Native folder picker and drag-and-drop, recursive discovery of nested repositories, worktrees, and submodules; multiple monitored roots.
-- Persistent canvas positions, layouts, viewport, appearance, and folder preferences.
+- Native multi-folder picker and drag-and-drop for selecting exact Git repositories and worktrees; named sidebar sections for organizing them.
+- Persistent repository selections, section assignments, canvas positions, layouts, viewport, and appearance.
 - File system event monitoring with debounced repository refresh, real branch and changed-file counts, staged and working-tree diffs, staging and unstaging.
 - Individual commit, amend of unpublished local commits, push, fetch, and fast-forward-only pull.
 - Independent bulk commit/push, fetch, and pull with per-repository results and retry.
@@ -46,8 +46,10 @@ With Node.js, Rust, and Tauri prerequisites installed:
 
 ```sh
 npm ci
-npm run desktop:dev
+npm run dev
 ```
+
+`npm run dev` compiles and opens the native desktop app directly, without creating or downloading an installer. Keep the command running while testing: frontend edits reload in the app, and Rust changes rebuild and restart it. Press Ctrl+C to stop. `npm run desktop:dev` remains an alias. To run only the frontend in a browser, use `npm run frontend:dev`; native Git features require the desktop app.
 
 Run `npm run build` for the frontend, `cargo test --manifest-path src-tauri/Cargo.toml --lib` for Git service tests, and `npm run tauri -- build --bundles dmg` on macOS to create a local installer.
 

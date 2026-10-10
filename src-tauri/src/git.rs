@@ -178,6 +178,20 @@ pub fn repo(path: &str) -> Result<Repo, String> {
         error: None,
     })
 }
+
+pub fn validate_repo_root(path: &str) -> Result<String, String> {
+    let canonical = std::fs::canonicalize(path).map_err(|e| e.to_string())?;
+    if !canonical.is_dir() {
+        return Err("Choose a repository folder".into());
+    }
+    let root = git(canonical.to_string_lossy().as_ref(), &["rev-parse", "--show-toplevel"])
+        .map_err(|_| "This folder is not a Git repository".to_string())?;
+    let actual = std::fs::canonicalize(root).map_err(|e| e.to_string())?;
+    if actual != canonical {
+        return Err("Choose the repository's top-level folder".into());
+    }
+    Ok(canonical.to_string_lossy().into_owned())
+}
 pub fn discover(root: &str, max_depth: usize) -> Result<Vec<Repo>, String> {
     let root_path = Path::new(root);
     if !root_path.is_dir() {
@@ -448,14 +462,16 @@ mod tests {
     use super::*;
     use std::{
         fs,
+        sync::atomic::{AtomicU64, Ordering},
         time::{SystemTime, UNIX_EPOCH},
     };
+    static FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
     fn fixture() -> (PathBuf, String) {
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!("git-monitor-test-{stamp}"));
+        let root = std::env::temp_dir().join(format!("git-monitor-test-{}-{stamp}-{}", std::process::id(), FIXTURE_ID.fetch_add(1, Ordering::Relaxed)));
         let nested = root.join("projects").join("one");
         fs::create_dir_all(&nested).unwrap();
         let p = nested.to_string_lossy().to_string();
@@ -481,6 +497,17 @@ mod tests {
         let tracked = r.files.iter().find(|f| f.path == "tracked.txt").unwrap();
         assert!(tracked.staged && tracked.unstaged);
         assert_eq!(diff(&p, "new.txt", false).unwrap().contains("+new"), true);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn selection_requires_the_repository_root() {
+        let (root, p) = fixture();
+        assert_eq!(validate_repo_root(&p).unwrap(), fs::canonicalize(&p).unwrap().to_string_lossy());
+        assert!(validate_repo_root(root.to_str().unwrap()).is_err());
+        let child = Path::new(&p).join("child");
+        fs::create_dir_all(&child).unwrap();
+        assert!(validate_repo_root(child.to_str().unwrap()).is_err());
         fs::remove_dir_all(root).unwrap();
     }
     #[test]

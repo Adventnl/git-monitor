@@ -3,7 +3,7 @@
   "productName": "git-monitor",
   "version": "0.1.1",
   "identifier": "app.git-monitor.desktop",
-  "build": { "beforeDevCommand": "npm run dev", "devUrl": "http://127.0.0.1:1420", "beforeBuildCommand": "npm run build", "frontendDist": "../dist" },
+  "build": { "beforeDevCommand": "npm run frontend:dev", "devUrl": "http://127.0.0.1:1420", "beforeBuildCommand": "npm run build", "frontendDist": "../dist" },
   "app": { "windows": [{ "title": "git-monitor", "titleBarStyle": "Overlay", "width": 1280, "height": 820, "minWidth": 780, "minHeight": 560, "backgroundColor": "#F7F9FC" }], "security": { "csp": "default-src 'self'; img-src 'self' asset: http://asset.localhost data:; style-src 'self' 'unsafe-inline'; connect-src ipc: http://ipc.localhost" } },
   "bundle": { "active": true, "targets": ["nsis", "dmg", "app"], "icon": ["icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png", "icons/icon.icns", "icons/icon.ico"], "shortDescription": "Monitor local Git repositories on a canvas", "category": "DeveloperTool", "windows": { "nsis": { "displayLanguageSelector": false, "languages": ["English"] } }, "macOS": { "minimumSystemVersion": "10.15" } }
 }

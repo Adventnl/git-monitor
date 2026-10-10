@@ -16,22 +16,22 @@ Developers working with multiple local Git repositories who want to inspect chan
 
 ## Product Purpose
 
-git-monitor discovers local repositories and presents their real branch and working tree state on an interactive canvas. Users inspect diffs and perform individual or bulk Git operations through the desktop interface.
+git-monitor monitors selected local repositories and presents their real branch and working tree state on an interactive canvas. Users inspect diffs and perform individual or bulk Git operations through the desktop interface.
 
 ## Positioning
 
-A spatial overview of many independent repositories, with detailed Git controls revealed only when a repository or root folder is opened.
+A spatial overview of many independent repositories, with named sidebar sections and detailed Git controls revealed when a repository is opened.
 
 ## Operating Context
 
-Runs as a Windows or macOS desktop application. Users choose one or more local folders; each is scanned recursively for Git repositories and worktrees. GitHub connectivity is optional for local monitoring.
+Runs as a Windows or macOS desktop application. Users select one or more exact Git repository folders and organize them into named sections. GitHub connectivity is optional for local monitoring.
 
 ## Capabilities and Constraints
 
 - Real Git operations only; no mock repository state or simulated changes.
-- Recursive discovery, automatic monitoring, changed file and diff inspection, staging, commits, push, fetch, safe pull, branch management, and bulk operations.
+- Multi-selection of repository folders, automatic monitoring, named sections, changed file and diff inspection, staging, commits, push, fetch, safe pull, branch management, and bulk operations.
 - GitHub PR creation, including moving work from a main branch to a feature branch, must protect user work and report partial failures honestly.
-- Persist roots, canvas layout and preferences locally. Store GitHub credentials in OS credential storage.
+- Persist repository paths, section assignments, canvas layout and preferences locally. Store GitHub credentials in OS credential storage.
 - Distribute installable Windows and macOS builds through GitHub Releases.
 
 ## Brand Commitments
