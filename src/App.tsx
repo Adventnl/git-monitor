@@ -60,8 +60,13 @@ export default function App() {
   const trackingGeneration=useRef(0);
   const settingsRef=useRef(settings); settingsRef.current=settings;
   const reposRef=useRef(repos); reposRef.current=repos;
+  const isViewportSame=(current:[number,number,number], next:[number,number,number]) => Math.abs(current[0]-next[0]) < 0.5 && Math.abs(current[1]-next[1]) < 0.5 && Math.abs(current[2]-next[2]) < 0.0001;
   const notify=(message:string)=>{setToast(message);window.setTimeout(()=>setToast(null),6500)};
-  const saveSettings=async (next:Settings)=>{const generation=trackingGeneration.current;try{const saved=await api<Settings>('update_settings',{settings:next});if(generation===trackingGeneration.current){setSettings(saved);settingsRef.current=saved}}catch(e){notify(errText(e))}};
+  const saveSettings=async (next:Settings)=>{
+    if(JSON.stringify(next)===JSON.stringify(settingsRef.current))return;
+    const generation=trackingGeneration.current;
+    try{const saved=await api<Settings>('update_settings',{settings:next});if(generation===trackingGeneration.current){setSettings(saved);settingsRef.current=saved}}catch(e){notify(errText(e))}
+  };
   const refreshRepo=useCallback(async (path:string)=>{try{const r=await api<Repo>('inspect_repo',{path});if(settingsRef.current.repos.includes(path))setRepos(prev=>prev.map(item=>item.path===path?r:item))}catch(e){if(settingsRef.current.repos.includes(path))setRepos(prev=>prev.map(item=>item.path===path?{...item,error:errText(e)}:item))}},[]);
   const refreshAll=useCallback(async (paths?:string[])=>{
     const generation=++refreshGeneration.current;
@@ -94,7 +99,10 @@ export default function App() {
     const bottom=Math.max(...points.map(p=>p[1]+90));
     const padding=48;
     const zoom=Math.min(1,Math.max(0.05,Math.min((element.clientWidth-padding*2)/(right-left),(element.clientHeight-padding*2)/(bottom-top))));
-    flow.current.setViewport({x:(element.clientWidth-(left+right)*zoom)/2,y:(element.clientHeight-(top+bottom)*zoom)/2,zoom},{duration});
+    const nextViewport={x:(element.clientWidth-(left+right)*zoom)/2,y:(element.clientHeight-(top+bottom)*zoom)/2,zoom};
+    const current=flow.current.getViewport();
+    if(isViewportSame([current.x,current.y,current.zoom],[nextViewport.x,nextViewport.y,nextViewport.zoom]))return;
+    flow.current.setViewport(nextViewport,{duration});
   };
   useEffect(()=>{
     if(!settingsLoaded||!flowReady||!visibleRepos.length||canvasReady.current)return;
@@ -108,8 +116,10 @@ export default function App() {
         return px*zoom+x<element.clientWidth&&((px+170)*zoom+x)>0&&py*zoom+y<element.clientHeight&&((py+90)*zoom+y)>0;
       });
       canvasReady.current=true;
-      if(inView)flow.current?.setViewport({x,y,zoom});
-      else fitCanvas(visibleRepos,settingsRef.current.positions,0);
+      const nextViewport={x,y,zoom};
+      const current=flow.current?.getViewport();
+      if(inView && current && !isViewportSame([current.x,current.y,current.zoom],[nextViewport.x,nextViewport.y,nextViewport.zoom]))flow.current?.setViewport(nextViewport);
+      else if(!inView) fitCanvas(visibleRepos,settingsRef.current.positions,0);
     });
     return()=>cancelAnimationFrame(frame);
   },[settingsLoaded,flowReady,visibleRepos]);
@@ -123,7 +133,14 @@ export default function App() {
     currentRepos.forEach((repo,i)=>{if(layout==='radial'){const angle=(i/Math.max(currentRepos.length,1))*Math.PI*2;positions[repo.path]=[550+Math.cos(angle)*310,320+Math.sin(angle)*220]}else if(layout==='tree'){positions[repo.path]=[220+(i%4)*220,180+Math.floor(i/4)*105]}else{positions[repo.path]=[230+(i%4)*220,180+Math.floor(i/4)*105]}});
     saveSettings({...settingsRef.current,layout,positions});window.setTimeout(()=>fitCanvas(currentRepos,positions,350),120);
   },[]);
-  useEffect(()=>{setNodes(visibleRepos.map((repo,i)=>{const pos=settings.positions[repo.path]||[230+(i%4)*220,180+Math.floor(i/4)*105];return {id:repo.path,type:'canvas',position:{x:pos[0],y:pos[1]},data:{title:repo.name,subtitle:repo.branch,count:repo.files.length,dirty:repo.files.length>0,ahead:repo.ahead,behind:repo.behind,error:repo.error||undefined,kind:repo.kind},selected:selected===repo.path||selectedPaths.includes(repo.path)}}))},[visibleRepos,settings.positions,selected,selectedPaths]);
+  useEffect(()=>{setNodes(previousNodes=>{
+    // React Flow hides nodes without dimensions; keep measurements when settings change.
+    const measuredByPath=new Map(previousNodes.map(node=>[node.id,node.measured]));
+    return visibleRepos.map((repo,i)=>{
+      const pos=settings.positions[repo.path]||[230+(i%4)*220,180+Math.floor(i/4)*105];
+      return {id:repo.path,type:'canvas',position:{x:pos[0],y:pos[1]},measured:measuredByPath.get(repo.path),data:{title:repo.name,subtitle:repo.branch,count:repo.files.length,dirty:repo.files.length>0,ahead:repo.ahead,behind:repo.behind,error:repo.error||undefined,kind:repo.kind},selected:selected===repo.path||selectedPaths.includes(repo.path)};
+    });
+  })},[visibleRepos,settings.positions,selected,selectedPaths]);
   const edges=useMemo<Edge[]>(()=>[],[]);
   const onNodesChange=(changes:NodeChange<Node<NodeData>>[])=>setNodes(prev=>applyNodeChanges(changes,prev));
   const onSelectionChange=useCallback(({nodes:chosen}:{nodes:Node<NodeData>[]})=>{const next=chosen.map(n=>n.id);setSelectedPaths(old=>old.length===next.length&&old.every((path,i)=>path===next[i])?old:next)},[]);
@@ -143,8 +160,7 @@ export default function App() {
       <div className="top-actions">{selectedPaths.length>0&&<span className="selection-count">{plural(selectedPaths.length,'selected')}</span>}<button className="round-action" aria-label="Refresh visible repositories" title="Refresh" onClick={()=>refreshAll()}><RefreshCw size={15} className={loading?'spin':''}/></button><button className="commit-all" onClick={()=>launchBulk('commit_push')}><ArrowUp size={15}/> {selectedPaths.length?'Commit & Push Selected':'Commit & Push All'}</button><div className="menu-wrap"><button className="round-action" aria-label="More actions" onClick={()=>setMenu(!menu)}><MoreHorizontal size={19}/></button>{menu&&<div className="action-menu">
         <button onClick={()=>launchBulk('commit_push')}>Commit & Push {selectedPaths.length?'Selected':'All'}</button><button onClick={()=>launchBulk('fetch')}>Fetch {selectedPaths.length?'Selected':'All'}</button><button onClick={()=>launchBulk('pull')}>Pull {selectedPaths.length?'Selected':'All'}</button><hr/><button onClick={()=>{setSelectedPaths(visibleRepos.map(r=>r.path));setMenu(false)}}>Select all visible</button><button onClick={()=>{setSelectedPaths(visibleRepos.filter(r=>r.files.length).map(r=>r.path));setMenu(false)}}>Select changed</button><button onClick={()=>{setSelectedPaths([]);setMenu(false)}}>Deselect all</button><hr/><button onClick={()=>{setModal('sections');setMenu(false)}}>Organize sections</button><button onClick={()=>{addRepos();setMenu(false)}}>Add repositories</button><button onClick={()=>{autoLayout();setMenu(false)}}>Auto Layout</button><button onClick={()=>{fitCanvas();setMenu(false)}}>Fit Canvas</button><hr/><button onClick={()=>{setModal('settings');setMenu(false)}}>Settings</button>
       </div>}</div></div>
-      <div className="flow-wrap" ref={flowWrap}><span style={{position:"absolute",top:100,left:100,zIndex:100,background:"white"}}>debug nodes {nodes.length} flow {flow.current?.getNodes().length} ready {String(canvasReady.current)}</span><ReactFlow nodes={nodes} edges={edges} nodeTypes={nodeTypes} onInit={i=>{flow.current=i;setFlowReady(true)}} onNodesChange={onNodesChange} onNodeDragStop={persistPositions} onSelectionChange={onSelectionChange} onNodeClick={(_,n)=>setSelected(n.id)} onPaneClick={()=>{setSelected(null);setSelectedPaths([])}} onMoveEnd={(_,v)=>{if(!canvasReady.current)return;const old=settingsRef.current;if(Math.abs(old.viewport[0]-v.x)>1||Math.abs(old.viewport[1]-v.y)>1||Math.abs(old.viewport[2]-v.zoom)>.01)saveSettings({...old,viewport:[v.x,v.y,v.zoom]})}} proOptions={{hideAttribution:true}} minZoom={0.05} maxZoom={1.6} selectionOnDrag multiSelectionKeyCode="Shift" panOnDrag><Background variant={BackgroundVariant.Dots} gap={18} size={0.7} color={settings.grid?'#dde4ee':'transparent'}/><Controls showInteractive={false} onFitView={()=>fitCanvas()} className="canvas-controls"/></ReactFlow>{visibleRepos.length===0&&<div className="section-empty"><Folder size={22}/><strong>No repositories in this section</strong><span>Use Organize to add repositories here.</span><button className="secondary-button" onClick={()=>setModal('sections')}>Organize repositories</button></div>}</div>
-    </>}
+      <div className="flow-wrap" ref={flowWrap}><ReactFlow nodes={nodes} edges={edges} nodeTypes={nodeTypes} onInit={i=>{flow.current=i;setFlowReady(true)}} onNodesChange={onNodesChange} onNodeDragStop={persistPositions} onSelectionChange={onSelectionChange} onNodeClick={(_,n)=>setSelected(n.id)}       onPaneClick={()=>{setSelected(null);setSelectedPaths([])}} onMoveEnd={(_,v)=>{if(!canvasReady.current)return;const nextViewport=[v.x,v.y,v.zoom] as [number,number,number];const old=settingsRef.current; if(!isViewportSame(old.viewport,nextViewport))saveSettings({...old,viewport:nextViewport})}} proOptions={{hideAttribution:true}} minZoom={0.05} maxZoom={1.6} selectionOnDrag multiSelectionKeyCode="Shift" panOnDrag><Background variant={BackgroundVariant.Dots} gap={18} size={0.7} color={settings.grid?'#dde4ee':'transparent'}/><Controls showInteractive={false} onFitView={()=>fitCanvas()} className="canvas-controls"/></ReactFlow>{visibleRepos.length===0&&<div className="section-empty"><Folder size={22}/><strong>No repositories in this section</strong><span>Use Organize to add repositories here.</span><button className="secondary-button" onClick={()=>setModal('sections')}>Organize repositories</button></div>}</div>    </>}
     {activeRepo&&<Inspector repo={activeRepo} refresh={()=>refreshRepo(activeRepo.path)} close={()=>setSelected(null)} remove={()=>removeRepo(activeRepo.path)} notify={notify} openTransfer={()=>{setModal('transfer')}} openPr={()=>setModal('pr')}/>}
     {searchOpen&&<div className="search-overlay"><div className="search-dialog"><div className="search-input"><Search size={17}/><input autoFocus placeholder="Find a repository…" value={search} onChange={e=>setSearch(e.target.value)}/><button onClick={()=>setSearchOpen(false)}><X size={15}/></button></div><div className="search-results">{repos.filter(r=>r.name.toLowerCase().includes(search.toLowerCase())).slice(0,30).map(r=><button key={r.path} onClick={()=>{selectSection(null);setSelected(r.path);setSearchOpen(false);flow.current?.setCenter(settings.positions[r.path]?.[0]||230,settings.positions[r.path]?.[1]||180,{zoom:1,duration:300})}}><Github size={15}/><span>{r.name}</span><small>{sectionFor(r.path)?.name||'Ungrouped'}</small></button>)}</div></div></div>}
     {modal==='bulk'&&<BulkModal action={bulkAction} repos={scopedRepos} close={()=>setModal(null)} refresh={()=>refreshAll()} notify={notify} progress={progress} setProgress={setProgress} results={results} setResults={setResults}/>}
