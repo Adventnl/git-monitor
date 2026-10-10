@@ -6,6 +6,7 @@ import { listen } from '@tauri-apps/api/event';
 import { open as chooseFolder } from '@tauri-apps/plugin-dialog';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import { getCurrentWindow } from '@tauri-apps/api/window';
+import { useUpdater, type Updater } from './useUpdater';
 import { Folder, GitBranch, Github, MoreHorizontal, Plus, RefreshCw, Settings2, Search, X, Minus, Maximize2, ChevronDown, GitPullRequest, ArrowUp, ArrowDown, Check, FileText, GitCommitHorizontal, History, PanelRightClose } from 'lucide-react';
 
 type FileChange = { path:string; status:string; staged:boolean; unstaged:boolean };
@@ -39,6 +40,7 @@ function CanvasNode({data}:NodeProps<Node<NodeData>>) {
 const nodeTypes = { canvas: CanvasNode };
 
 export default function App() {
+  const updater=useUpdater();
   const [settings,setSettings]=useState<Settings>(initialSettings);
   const [repos,setRepos]=useState<Repo[]>([]);
   const [nodes,setNodes]=useState<Node<NodeData>[]>([]);
@@ -190,11 +192,13 @@ export default function App() {
     {activeRepo&&<Inspector repo={activeRepo} refresh={()=>refreshRepo(activeRepo.path)} close={()=>setSelected(null)} remove={()=>removeRepo(activeRepo.path)} notify={notify} pull={()=>{if(bulkJobRef.current?.busy){notify('Wait for the current operation to finish');return}setSelected(null);runBulk('pull',{paths:[activeRepo.path],message:'',mode:'all',includeUntracked:true})}} openTransfer={()=>{setModal('transfer')}} openPr={()=>setModal('pr')}/>}
     {searchOpen&&<div className="search-overlay"><div className="search-dialog"><div className="search-input"><Search size={17}/><input autoFocus placeholder="Find a repository…" value={search} onChange={e=>setSearch(e.target.value)}/><button onClick={()=>setSearchOpen(false)}><X size={15}/></button></div><div className="search-results">{repos.filter(r=>r.name.toLowerCase().includes(search.toLowerCase())).slice(0,30).map(r=><button key={r.path} onClick={()=>{selectSection(null);setSelected(r.path);setSearchOpen(false);flow.current?.setCenter(settings.positions[r.path]?.[0]||230,settings.positions[r.path]?.[1]||180,{zoom:1,duration:300})}}><Github size={15}/><span>{r.name}</span><small>{sectionFor(r.path)?.name||'Ungrouped'}</small></button>)}</div></div></div>}
     {modal==='bulk'&&<BulkModal action={bulkAction} repos={scopedRepos} close={()=>setModal(null)} start={options=>runBulk(bulkAction,options)}/>}
-    {modal==='settings'&&<SettingsModal settings={settings} save={saveSettings} close={()=>setModal(null)} addRepos={addRepos} removeRepo={removeRepo} autoLayout={autoLayout} notify={notify}/>}
+    {modal==='settings'&&<SettingsModal settings={settings} save={saveSettings} close={()=>setModal(null)} addRepos={addRepos} removeRepo={removeRepo} autoLayout={autoLayout} notify={notify} updater={updater}/>}
     {modal==='sections'&&<SectionsModal settings={settings} save={saveSettings} close={()=>setModal(null)} />}
     {modal==='transfer'&&activeRepo&&<TransferModal repo={activeRepo} close={()=>setModal(null)} notify={notify} refresh={()=>refreshRepo(activeRepo.path)}/>}
     {modal==='pr'&&activeRepo&&<PrModal repo={activeRepo} close={()=>setModal(null)} notify={notify}/>}
     {bulkJob&&<BulkStatus job={bulkJob} retry={()=>runBulk(bulkJob.action,bulkJob,true)} dismiss={()=>setBulkJob(null)}/>}
+    {updater.phase==='available'&&!updater.dismissed&&<aside className="update-notice" role="status"><div><strong>git-monitor {updater.availableVersion} is ready</strong><span>A new release is available to install.</span></div><button className="primary-button" onClick={updater.install}>Update</button><button className="update-dismiss" onClick={updater.dismiss} aria-label="Dismiss update notice"><X size={14}/></button></aside>}
+    {(updater.phase==='downloading'||updater.phase==='installing')&&<aside className="update-notice" role="status"><RefreshCw size={16} className="spin"/><div><strong>{updater.message}</strong>{updater.progress!==null&&updater.phase==='downloading'&&<span>{updater.progress}% downloaded</span>}</div></aside>}
     {toast&&<div className="toast" role="status">{toast}<button onClick={()=>setToast(null)} aria-label="Dismiss"><X size={14}/></button></div>}
   </main>;
 }
@@ -246,13 +250,14 @@ function BulkStatus({job,retry,dismiss}:{job:BulkJob;retry:()=>void;dismiss:()=>
   </aside>;
 }
 
-function SettingsModal({settings,save,close,addRepos,removeRepo,autoLayout,notify}:{settings:Settings;save:(s:Settings)=>Promise<void>;close:()=>void;addRepos:()=>void;removeRepo:(s:string)=>void;autoLayout:(layout:string)=>void;notify:(s:string)=>void}) {
+function SettingsModal({settings,save,close,addRepos,removeRepo,autoLayout,notify,updater}:{settings:Settings;save:(s:Settings)=>Promise<void>;close:()=>void;addRepos:()=>void;removeRepo:(s:string)=>void;autoLayout:(layout:string)=>void;notify:(s:string)=>void;updater:Updater}) {
   const [gitVersion,setGitVersion]=useState('Checking…'),[connected,setConnected]=useState(false),[device,setDevice]=useState<DeviceCode|null>(null),[connecting,setConnecting]=useState(false);
   useEffect(()=>{api<string>('git_version').then(setGitVersion).catch(e=>setGitVersion(errText(e)));api<boolean>('github_connected').then(setConnected)},[]);
   const connect=async()=>{try{setConnecting(true);const code=await api<DeviceCode>('github_begin');setDevice(code);await openUrl(code.verificationUri);await api('github_finish',{code});setConnected(true);setDevice(null);notify('GitHub connected')}catch(e){notify(errText(e))}finally{setConnecting(false)}};
   return <div className="modal-backdrop"><div className="dialog settings-dialog"><button className="close" aria-label="Close" onClick={close}><X size={16}/></button><h2>Settings</h2><div className="settings-group"><h3>Repositories</h3>{settings.repos.map(r=><div className="settings-root" key={r}><Github size={15}/><span title={r}>{r}</span><button onClick={()=>removeRepo(r)} aria-label={`Stop tracking ${nameOf(r)}`} title="Remove from git-monitor; files stay on disk">Stop tracking</button></div>)}<button className="text-action" onClick={addRepos}><Plus size={14}/> Add repositories</button></div>
   <div className="settings-group"><h3>Canvas</h3><label>Layout<select value={settings.layout} onChange={e=>autoLayout(e.target.value)}><option value="horizontal">Horizontal</option><option value="tree">Tree</option><option value="radial">Radial</option></select></label><label>Appearance<select value={settings.appearance} onChange={e=>save({...settings,appearance:e.target.value})}><option value="light">Light</option><option value="dark">Dark</option><option value="system">System</option></select></label><label><input type="checkbox" checked={settings.grid} onChange={e=>save({...settings,grid:e.target.checked})}/> Show canvas dots</label><label><input type="checkbox" checked={settings.autoMonitor} onChange={e=>save({...settings,autoMonitor:e.target.checked})}/> Monitor file changes</label></div>
-  <div className="settings-group"><h3>Integrations</h3><div className="integration-row"><span><GitBranch size={15}/> Git <small>{gitVersion}</small></span></div><div className="integration-row"><span><Github size={15}/> GitHub <small>{connected?'Connected':'Not connected'}</small></span>{connected?<button onClick={async()=>{try{await api('github_disconnect');setConnected(false)}catch(e){notify(errText(e))}}}>Disconnect</button>:<button onClick={connect} disabled={connecting}>{connecting?'Connecting…':'Connect'}</button>}</div>{device&&<p className="device-code">Enter code <strong>{device.userCode}</strong> at GitHub in your browser.</p>}</div><div className="dialog-actions"><button className="primary-button" onClick={close}>Done</button></div></div></div>;
+  <div className="settings-group"><h3>Integrations</h3><div className="integration-row"><span><GitBranch size={15}/> Git <small>{gitVersion}</small></span></div><div className="integration-row"><span><Github size={15}/> GitHub <small>{connected?'Connected':'Not connected'}</small></span>{connected?<button onClick={async()=>{try{await api('github_disconnect');setConnected(false)}catch(e){notify(errText(e))}}}>Disconnect</button>:<button onClick={connect} disabled={connecting}>{connecting?'Connecting…':'Connect'}</button>}</div>{device&&<p className="device-code">Enter code <strong>{device.userCode}</strong> at GitHub in your browser.</p>}</div>
+  <div className="settings-group"><h3>App updates</h3><div className="integration-row"><span>git-monitor <small>{updater.version?`v${updater.version}`:'Checking version…'}</small></span><button onClick={()=>updater.checkForUpdates(true)} disabled={updater.phase==='checking'||updater.phase==='downloading'||updater.phase==='installing'}>{updater.phase==='checking'?'Checking…':'Check for updates'}</button></div>{updater.phase==='available'&&<div className="integration-row"><span>Version {updater.availableVersion} available</span><button onClick={updater.install}>Download and install</button></div>}{updater.message&&<p className={`update-message ${updater.phase==='error'?'failed':''}`} role="status">{updater.message}</p>}</div><div className="dialog-actions"><button className="primary-button" onClick={close}>Done</button></div></div></div>;
 }
 
 function SectionsModal({settings,save,close}:{settings:Settings;save:(s:Settings)=>Promise<void>;close:()=>void}) {

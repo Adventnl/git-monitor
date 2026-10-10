@@ -1,6 +1,6 @@
 [package]
 name = "git-monitor"
-version = "0.1.1"
+version = "0.2.0"
 description = "A quiet canvas for real Git repositories"
 authors = ["git-monitor contributors"]
 edition = "2021"
@@ -24,3 +24,5 @@ reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-feature
 keyring = { version = "3", features = ["apple-native", "windows-native"] }
 tokio = { version = "1", features = ["time", "rt"] }
 url = "2"
+tauri-plugin-updater = "2"
+tauri-plugin-process = "2"
