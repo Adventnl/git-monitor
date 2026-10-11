@@ -6,6 +6,7 @@ import { listen } from '@tauri-apps/api/event';
 import { open as chooseFolder } from '@tauri-apps/plugin-dialog';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import { getCurrentWindow } from '@tauri-apps/api/window';
+import { useUpdater, type Updater } from './useUpdater';
 import { Folder, GitBranch, Github, MoreHorizontal, Plus, RefreshCw, Settings2, Search, X, Minus, Maximize2, ChevronDown, GitPullRequest, ArrowUp, ArrowDown, Check, FileText, GitCommitHorizontal, History, PanelRightClose } from 'lucide-react';
 
 type FileChange = { path:string; status:string; staged:boolean; unstaged:boolean };
@@ -13,6 +14,9 @@ type Repo = { path:string; name:string; branch:string; kind:string; files:FileCh
 type Section = { id:string; name:string; paths:string[] };
 type Settings = { repos:string[]; sections:Section[]; layout:string; positions:Record<string,[number,number]>; viewport:[number,number,number]; grid:boolean; autoMonitor:boolean; appearance:string };
 type OpResult = { path:string; status:string; detail:string; committed:boolean; pushed:boolean };
+type BulkAction = 'commit_push'|'fetch'|'pull';
+type BulkOptions = { paths:string[]; message:string; mode:string; includeUntracked:boolean };
+type BulkJob = BulkOptions & { runId:string; action:BulkAction; pending:number; completed:number; busy:boolean; results:OpResult[]; error:string|null };
 type TransferPreview = { scenario:string; files:string[]; commits:string[]; conflictFiles:string[]; warning:string };
 type DeviceCode = { deviceCode:string; userCode:string; verificationUri:string; expiresIn:number; interval:number };
 type NodeData = Record<string, unknown> & { title:string; subtitle:string; count?:number; dirty?:boolean; ahead?:number; behind?:number; error?:string; kind?:string };
@@ -36,6 +40,7 @@ function CanvasNode({data}:NodeProps<Node<NodeData>>) {
 const nodeTypes = { canvas: CanvasNode };
 
 export default function App() {
+  const updater=useUpdater();
   const [settings,setSettings]=useState<Settings>(initialSettings);
   const [repos,setRepos]=useState<Repo[]>([]);
   const [nodes,setNodes]=useState<Node<NodeData>[]>([]);
@@ -44,13 +49,14 @@ export default function App() {
   const [activeSection,setActiveSection]=useState<string|null>(null);
   const [menu,setMenu]=useState(false);
   const [modal,setModal]=useState<'bulk'|'settings'|'sections'|'transfer'|'pr'|null>(null);
-  const [bulkAction,setBulkAction]=useState<'commit_push'|'fetch'|'pull'>('commit_push');
+  const [bulkAction,setBulkAction]=useState<BulkAction>('commit_push');
   const [toast,setToast]=useState<string|null>(null);
   const [loading,setLoading]=useState(false);
   const [search,setSearch]=useState('');
   const [searchOpen,setSearchOpen]=useState(false);
-  const [progress,setProgress]=useState<{index:number;total:number}|null>(null);
-  const [results,setResults]=useState<OpResult[]|null>(null);
+  const [bulkJob,setBulkJob]=useState<BulkJob|null>(null);
+  const bulkJobRef=useRef<BulkJob|null>(null); bulkJobRef.current=bulkJob;
+  const bulkRunId=useRef('');
   const [settingsLoaded,setSettingsLoaded]=useState(false);
   const [flowReady,setFlowReady]=useState(false);
   const flow=useRef<ReactFlowInstance<Node<NodeData>,Edge>|null>(null);
@@ -79,7 +85,10 @@ export default function App() {
   useEffect(()=>{if(!('__TAURI_INTERNALS__' in window))return;api<Settings>('get_settings').then(s=>{setSettings(s);settingsRef.current=s;setSettingsLoaded(true);refreshAll(s.repos)}).catch(e=>notify(errText(e)))},[refreshAll]);
   useEffect(()=>{if(!('__TAURI_INTERNALS__' in window))return;let a:(()=>void)|undefined,b:(()=>void)|undefined;let timer:number|undefined;const pending=new Set<string>();
     listen<string>('git-changed',e=>{pending.add(e.payload);window.clearTimeout(timer);timer=window.setTimeout(()=>{const changed=[...pending];pending.clear();const paths=new Set<string>();for(const path of changed){reposRef.current.filter(r=>path===r.path||path.startsWith(r.path+'/')||path.startsWith(r.path+'\\')).forEach(r=>paths.add(r.path))}paths.forEach(refreshRepo)},500)}).then(fn=>a=fn);
-    listen<{index:number;total:number}>('bulk-progress',e=>setProgress({index:e.payload.index,total:e.payload.total})).then(fn=>b=fn);
+    listen<{runId:string;index:number;total:number;result:OpResult}>('bulk-progress',e=>{
+      if(e.payload.runId!==bulkRunId.current)return;
+      setBulkJob(previous=>previous?{...previous,completed:e.payload.index,results:[...previous.results.filter(r=>r.path!==e.payload.result.path),e.payload.result]}:previous);
+    }).then(fn=>b=fn);
     return()=>{a?.();b?.();window.clearTimeout(timer)};
   },[refreshRepo]);
   const addPaths=async(paths:string[])=>{const added:string[]=[];const errors:string[]=[];for(const path of paths){try{const s=await api<Settings>('add_repos',{paths:[path]});trackingGeneration.current++;setSettings(s);settingsRef.current=s;added.push(path)}catch(e){errors.push(`${nameOf(path)}: ${errText(e)}`)}}if(added.length)await refreshAll();if(errors.length)notify(errors.join(' · '));else if(added.length)notify(`${plural(added.length,'repository')} added`)};
@@ -147,7 +156,26 @@ export default function App() {
   const persistPositions=()=>{const positions={...settingsRef.current.positions};nodes.forEach(n=>positions[n.id]=[n.position.x,n.position.y]);saveSettings({...settingsRef.current,positions})};
   const activeRepo=repos.find(r=>r.path===selected)||null;
   const scopedRepos=useMemo(()=>selectedPaths.length?visibleRepos.filter(r=>selectedPaths.includes(r.path)):visibleRepos,[selectedPaths,visibleRepos]);
-  const launchBulk=(action:'commit_push'|'fetch'|'pull')=>{setBulkAction(action);setResults(null);setProgress(null);setModal('bulk');setMenu(false)};
+  const runBulk=async(action:BulkAction,options:BulkOptions,retry=false)=>{
+    const current=bulkJobRef.current;
+    if(current?.busy)return;
+    const pending=retry?(current?.results.filter(r=>r.status==='failed')||[]):options.paths.map(path=>({path,committed:false}));
+    if(!pending.length)return;
+    const runId=`${Date.now()}-${Math.random()}`;
+    const job:BulkJob={...options,action,runId,pending:pending.length,completed:0,busy:true,results:retry?current?.results||[]:[],error:null};
+    bulkRunId.current=runId;
+    bulkJobRef.current=job;
+    setBulkJob(job);
+    setModal(null);
+    try{
+      const results=await api<OpResult[]>('bulk_operation',{request:{runId,paths:pending.map(r=>r.path),action,message:options.message,mode:options.mode,includeUntracked:options.includeUntracked,committedPaths:retry?pending.filter(r=>r.committed).map(r=>r.path):[]}});
+      setBulkJob(previous=>previous?.runId===runId?{...previous,busy:false,completed:pending.length,results:[...previous.results.filter(old=>!results.some(r=>r.path===old.path)),...results]}:previous);
+      refreshAll();
+    }catch(e){
+      setBulkJob(previous=>previous?.runId===runId?{...previous,busy:false,error:errText(e)}:previous);
+    }
+  };
+  const launchBulk=(action:BulkAction)=>{if(bulkJobRef.current?.busy){notify('Wait for the current operation to finish');return}setBulkAction(action);setModal('bulk');setMenu(false)};
   const selectSection=(id:string|null)=>{setActiveSection(id);setSelected(null);setSelectedPaths([])};
   useEffect(()=>{const onKey=(e:KeyboardEvent)=>{const mod=e.metaKey||e.ctrlKey;if(e.key==='Escape'){setModal(null);setSelected(null);setMenu(false);setSearchOpen(false)}if(mod&&e.key.toLowerCase()==='o'){e.preventDefault();addRepos()}if(mod&&e.key.toLowerCase()==='r'){e.preventDefault();refreshAll()}if(mod&&e.key.toLowerCase()==='f'){e.preventDefault();setSearchOpen(true)}if(mod&&(e.key==='+'||e.key==='=')){e.preventDefault();flow.current?.zoomIn()}if(mod&&e.key==='-'){e.preventDefault();flow.current?.zoomOut()}};window.addEventListener('keydown',onKey);return()=>window.removeEventListener('keydown',onKey)},[refreshAll]);
   useEffect(()=>{if(!('__TAURI_INTERNALS__' in window))return;let unlisten:(()=>void)|undefined;getCurrentWindow().onDragDropEvent(async event=>{if(event.payload.type==='drop')await addPaths(event.payload.paths)}).then(fn=>unlisten=fn);return()=>unlisten?.()},[refreshAll]);
@@ -161,20 +189,23 @@ export default function App() {
         <button onClick={()=>launchBulk('commit_push')}>Commit & Push {selectedPaths.length?'Selected':'All'}</button><button onClick={()=>launchBulk('fetch')}>Fetch {selectedPaths.length?'Selected':'All'}</button><button onClick={()=>launchBulk('pull')}>Pull {selectedPaths.length?'Selected':'All'}</button><hr/><button onClick={()=>{setSelectedPaths(visibleRepos.map(r=>r.path));setMenu(false)}}>Select all visible</button><button onClick={()=>{setSelectedPaths(visibleRepos.filter(r=>r.files.length).map(r=>r.path));setMenu(false)}}>Select changed</button><button onClick={()=>{setSelectedPaths([]);setMenu(false)}}>Deselect all</button><hr/><button onClick={()=>{setModal('sections');setMenu(false)}}>Organize sections</button><button onClick={()=>{addRepos();setMenu(false)}}>Add repositories</button><button onClick={()=>{autoLayout();setMenu(false)}}>Auto Layout</button><button onClick={()=>{fitCanvas();setMenu(false)}}>Fit Canvas</button><hr/><button onClick={()=>{setModal('settings');setMenu(false)}}>Settings</button>
       </div>}</div></div>
       <div className="flow-wrap" ref={flowWrap}><ReactFlow nodes={nodes} edges={edges} nodeTypes={nodeTypes} onInit={i=>{flow.current=i;setFlowReady(true)}} onNodesChange={onNodesChange} onNodeDragStop={persistPositions} onSelectionChange={onSelectionChange} onNodeClick={(_,n)=>setSelected(n.id)}       onPaneClick={()=>{setSelected(null);setSelectedPaths([])}} onMoveEnd={(_,v)=>{if(!canvasReady.current)return;const nextViewport=[v.x,v.y,v.zoom] as [number,number,number];const old=settingsRef.current; if(!isViewportSame(old.viewport,nextViewport))saveSettings({...old,viewport:nextViewport})}} proOptions={{hideAttribution:true}} minZoom={0.05} maxZoom={1.6} selectionOnDrag multiSelectionKeyCode="Shift" panOnDrag><Background variant={BackgroundVariant.Dots} gap={18} size={0.7} color={settings.grid?'#dde4ee':'transparent'}/><Controls showInteractive={false} onFitView={()=>fitCanvas()} className="canvas-controls"/></ReactFlow>{visibleRepos.length===0&&<div className="section-empty"><Folder size={22}/><strong>No repositories in this section</strong><span>Use Organize to add repositories here.</span><button className="secondary-button" onClick={()=>setModal('sections')}>Organize repositories</button></div>}</div>    </>}
-    {activeRepo&&<Inspector repo={activeRepo} refresh={()=>refreshRepo(activeRepo.path)} close={()=>setSelected(null)} remove={()=>removeRepo(activeRepo.path)} notify={notify} openTransfer={()=>{setModal('transfer')}} openPr={()=>setModal('pr')}/>}
+    {activeRepo&&<Inspector repo={activeRepo} refresh={()=>refreshRepo(activeRepo.path)} close={()=>setSelected(null)} remove={()=>removeRepo(activeRepo.path)} notify={notify} pull={()=>{if(bulkJobRef.current?.busy){notify('Wait for the current operation to finish');return}setSelected(null);runBulk('pull',{paths:[activeRepo.path],message:'',mode:'all',includeUntracked:true})}} openTransfer={()=>{setModal('transfer')}} openPr={()=>setModal('pr')}/>}
     {searchOpen&&<div className="search-overlay"><div className="search-dialog"><div className="search-input"><Search size={17}/><input autoFocus placeholder="Find a repository…" value={search} onChange={e=>setSearch(e.target.value)}/><button onClick={()=>setSearchOpen(false)}><X size={15}/></button></div><div className="search-results">{repos.filter(r=>r.name.toLowerCase().includes(search.toLowerCase())).slice(0,30).map(r=><button key={r.path} onClick={()=>{selectSection(null);setSelected(r.path);setSearchOpen(false);flow.current?.setCenter(settings.positions[r.path]?.[0]||230,settings.positions[r.path]?.[1]||180,{zoom:1,duration:300})}}><Github size={15}/><span>{r.name}</span><small>{sectionFor(r.path)?.name||'Ungrouped'}</small></button>)}</div></div></div>}
-    {modal==='bulk'&&<BulkModal action={bulkAction} repos={scopedRepos} close={()=>setModal(null)} refresh={()=>refreshAll()} notify={notify} progress={progress} setProgress={setProgress} results={results} setResults={setResults}/>}
-    {modal==='settings'&&<SettingsModal settings={settings} save={saveSettings} close={()=>setModal(null)} addRepos={addRepos} removeRepo={removeRepo} autoLayout={autoLayout} notify={notify}/>}
+    {modal==='bulk'&&<BulkModal action={bulkAction} repos={scopedRepos} close={()=>setModal(null)} start={options=>runBulk(bulkAction,options)}/>}
+    {modal==='settings'&&<SettingsModal settings={settings} save={saveSettings} close={()=>setModal(null)} addRepos={addRepos} removeRepo={removeRepo} autoLayout={autoLayout} notify={notify} updater={updater}/>}
     {modal==='sections'&&<SectionsModal settings={settings} save={saveSettings} close={()=>setModal(null)} />}
     {modal==='transfer'&&activeRepo&&<TransferModal repo={activeRepo} close={()=>setModal(null)} notify={notify} refresh={()=>refreshRepo(activeRepo.path)}/>}
     {modal==='pr'&&activeRepo&&<PrModal repo={activeRepo} close={()=>setModal(null)} notify={notify}/>}
+    {bulkJob&&<BulkStatus job={bulkJob} retry={()=>runBulk(bulkJob.action,bulkJob,true)} dismiss={()=>setBulkJob(null)}/>}
+    {updater.phase==='available'&&!updater.dismissed&&<aside className="update-notice" role="status"><div><strong>git-monitor {updater.availableVersion} is ready</strong><span>A new release is available to install.</span></div><button className="primary-button" onClick={updater.install}>Update</button><button className="update-dismiss" onClick={updater.dismiss} aria-label="Dismiss update notice"><X size={14}/></button></aside>}
+    {(updater.phase==='downloading'||updater.phase==='installing')&&<aside className="update-notice" role="status"><RefreshCw size={16} className="spin"/><div><strong>{updater.message}</strong>{updater.progress!==null&&updater.phase==='downloading'&&<span>{updater.progress}% downloaded</span>}</div></aside>}
     {toast&&<div className="toast" role="status">{toast}<button onClick={()=>setToast(null)} aria-label="Dismiss"><X size={14}/></button></div>}
   </main>;
 }
 
 function Diff({text}: {text:string}) {let oldLine=0,newLine=0;return <pre className="diff">{text?text.split('\n').map((line,i)=>{const hunk=line.match(/^@@ -(\d+)(?:,\d+)? \+(\d+)/);if(hunk){oldLine=Number(hunk[1]);newLine=Number(hunk[2])}const added=line.startsWith('+')&&!line.startsWith('+++'),removed=line.startsWith('-')&&!line.startsWith('---'),context=line.startsWith(' ');const oldNum=removed||context?oldLine++:'';const newNum=added||context?newLine++:'';return <div key={i} className={added?'diff-add':removed?'diff-remove':hunk?'diff-hunk':''}><span className="diff-num">{oldNum}<b>{newNum}</b></span><code>{line||' '}</code></div>}):<div className="diff-empty">No diff in this view.</div>}</pre>}
 
-function Inspector({repo,refresh,close,remove,notify,openTransfer,openPr}:{repo:Repo;refresh:()=>void;close:()=>void;remove:()=>void;notify:(s:string)=>void;openTransfer:()=>void;openPr:()=>void}) {
+function Inspector({repo,refresh,close,remove,notify,pull,openTransfer,openPr}:{repo:Repo;refresh:()=>void;close:()=>void;remove:()=>void;notify:(s:string)=>void;pull:()=>void;openTransfer:()=>void;openPr:()=>void}) {
   const [file,setFile]=useState<string|null>(null),[diff,setDiff]=useState(''),[stagedView,setStagedView]=useState(false),[message,setMessage]=useState(''),[mode,setMode]=useState('all'),[include,setInclude]=useState(true),[amend,setAmend]=useState(false),[busy,setBusy]=useState(false),[section,setSection]=useState<'changes'|'branches'|'history'|'prs'>('changes'),[branches,setBranches]=useState<string[]>([]),[history,setHistory]=useState<string[]>([]),[historyDiff,setHistoryDiff]=useState(''),[prs,setPrs]=useState<any[]>([]),[newBranch,setNewBranch]=useState('');
   useEffect(()=>{setFile(null);setDiff('');setSection('changes')},[repo.path]);
   useEffect(()=>{if(!file)return;api<string>('file_diff',{path:repo.path,file,staged:stagedView}).then(setDiff).catch(e=>notify(errText(e)))},[file,stagedView,repo.path,repo.files]);
@@ -191,29 +222,42 @@ function Inspector({repo,refresh,close,remove,notify,openTransfer,openPr}:{repo:
     {section==='branches'&&<div className="inspector-section"><div className="branch-list">{branches.map(b=><div key={b}><GitBranch size={14}/><span>{b}</span>{b===repo.branch&&<small>current</small>}<button onClick={()=>branchAction('switch',b)} disabled={b===repo.branch||busy}>Switch</button><button onClick={()=>branchAction('publish',b)} disabled={busy}>Publish</button>{b!==repo.branch&&<button onClick={()=>branchAction('delete',b)} disabled={busy}>Delete</button>}</div>)}</div><div className="inline-form"><input placeholder="New branch name" value={newBranch} onChange={e=>setNewBranch(e.target.value)}/><button onClick={()=>branchAction('create',newBranch)} disabled={!newBranch||busy}>Create</button></div><button className="text-action" onClick={()=>run(async()=>{await api('fetch_repo',{path:repo.path});notify('Fetched remote branches')})}>Fetch remote branches</button><button className="text-action" onClick={()=>{const next=prompt('Rename current branch to:');if(next)branchAction('rename',repo.branch,next)}}>Rename current branch</button></div>}
     {section==='history'&&<div className="history-list">{history.map(row=>{const [hash,date,...message]=row.split('\t');return <button key={hash} onClick={()=>api<string>('history_detail',{path:repo.path,hash}).then(setHistoryDiff).catch(e=>notify(errText(e)))}><GitCommitHorizontal size={15}/><span><strong>{message.join(' ')}</strong><small>{hash} · {date}</small></span></button>})}{!history.length&&<p>No commits yet.</p>}{historyDiff&&<Diff text={historyDiff}/>}</div>}
     {section==='prs'&&<div className="inspector-section"><button className="primary-button full" onClick={openPr}><GitPullRequest size={15}/> Create Pull Request</button><button className="secondary-button full" onClick={openTransfer}>PR from Different Branch</button><div className="pr-list">{prs.map(pr=><button key={pr.id} onClick={()=>openUrl(pr.html_url)}><GitPullRequest size={15}/><span>{pr.title}<small>#{pr.number} · {pr.state}</small></span></button>)}</div></div>}
-    <div className="inspector-footer"><button onClick={()=>run(async()=>{notify(await api<string>('fetch_repo',{path:repo.path}))})} disabled={busy}><RefreshCw size={14}/> Fetch</button><button onClick={()=>run(async()=>{notify(await api<string>('pull_repo',{path:repo.path}))})} disabled={busy}><ArrowDown size={14}/> Pull</button><button onClick={()=>run(async()=>{notify(await api<string>('manage_branch',{path:repo.path,action:'publish',name:repo.branch}))})} disabled={busy}><ArrowUp size={14}/> Push</button></div>
+    <div className="inspector-footer"><button onClick={()=>run(async()=>{notify(await api<string>('fetch_repo',{path:repo.path}))})} disabled={busy}><RefreshCw size={14}/> Fetch</button><button onClick={pull} disabled={busy}><ArrowDown size={14}/> Pull</button><button onClick={()=>run(async()=>{notify(await api<string>('manage_branch',{path:repo.path,action:'publish',name:repo.branch}))})} disabled={busy}><ArrowUp size={14}/> Push</button></div>
   </aside>;
 }
 
-function BulkModal({action,repos,close,refresh,notify,progress,setProgress,results,setResults}:{action:'commit_push'|'fetch'|'pull';repos:Repo[];close:()=>void;refresh:()=>void;notify:(s:string)=>void;progress:{index:number;total:number}|null;setProgress:(v:{index:number;total:number}|null)=>void;results:OpResult[]|null;setResults:(v:OpResult[]|null)=>void}) {
+function BulkModal({action,repos,close,start}:{action:BulkAction;repos:Repo[];close:()=>void;start:(options:BulkOptions)=>void}) {
   const eligible=useMemo(()=>repos.filter(r=>action==='commit_push'?r.files.length>0:action==='fetch'?!!r.remote:!!r.upstream&&r.behind>0),[repos,action]);
-  const [paths,setPaths]=useState<string[]>(eligible.map(r=>r.path)),[message,setMessage]=useState(''),[mode,setMode]=useState('all'),[include,setInclude]=useState(true),[busy,setBusy]=useState(false);
+  const [paths,setPaths]=useState<string[]>(eligible.map(r=>r.path)),[message,setMessage]=useState(''),[mode,setMode]=useState('all'),[include,setInclude]=useState(true);
   useEffect(()=>setPaths(eligible.map(r=>r.path)),[eligible]);
   const title=action==='commit_push'?'Commit & Push All':action==='fetch'?'Fetch All':'Pull All';
-  const run=async(retry=false)=>{setBusy(true);const pending=retry?(results||[]).filter(r=>r.status==='failed'):paths.map(path=>({path,committed:false}));setProgress({index:0,total:pending.length});try{const produced:OpResult[]=[];for(const item of pending){const nextAction=retry&&item.committed?'push':action;const [result]=await api<OpResult[]>('bulk_operation',{request:{paths:[item.path],action:nextAction,message,mode,includeUntracked:include}});produced.push(result);setProgress({index:produced.length,total:pending.length})}setResults(retry?[...(results||[]).filter(r=>r.status!=='failed'),...produced]:produced);refresh()}catch(e){notify(errText(e))}finally{setBusy(false)}};
   return <div className="modal-backdrop"><div className="dialog bulk-dialog"><button className="close" aria-label="Close" onClick={close}><X size={16}/></button><h2>{title}</h2><p>{action==='commit_push'?'Each selected repository receives its own commit and push.':action==='fetch'?'Download remote updates without changing working files.':'Only branches that can fast-forward safely will update.'}</p>{action==='commit_push'&&<><input className="dialog-input" placeholder="Commit message" value={message} onChange={e=>setMessage(e.target.value)}/><div className="bulk-options"><select value={mode} onChange={e=>setMode(e.target.value)}><option value="all">Commit all changes</option><option value="tracked">Commit tracked changes</option><option value="staged">Staged only</option></select><label><input type="checkbox" checked={include} onChange={e=>setInclude(e.target.checked)} disabled={mode!=='all'}/> Include untracked files</label></div></>}
-    <div className="bulk-list">{eligible.map(r=><label key={r.path}><input type="checkbox" checked={paths.includes(r.path)} onChange={e=>setPaths(p=>e.target.checked?[...p,r.path]:p.filter(x=>x!==r.path))}/><span className="bulk-repo">{r.name}</span><small>{action==='commit_push'?plural(r.files.length,'file'):r.upstream||r.remote}</small><span className="bulk-result">{results?.find(x=>x.path===r.path)?.status||''}</span></label>)}{!eligible.length&&<div className="quiet-empty">No repositories need this action.</div>}</div>
-    {progress&&<p className="progress">{progress.index} / {progress.total} repositories completed</p>}{results&&<div className="result-list">{results.map(r=><div key={r.path}><strong>{nameOf(r.path)}</strong><span className={r.status}>{r.status}</span><small>{r.detail}</small></div>)}</div>}
-    <div className="dialog-actions"><button onClick={close}>{results?'Done':'Cancel'}</button><button className="primary-button" disabled={busy||(results?!results.some(r=>r.status==='failed'):!paths.length||(action==='commit_push'&&!message.trim()))} onClick={()=>run(!!results)}>{busy?'Working…':results?'Retry failed':title}</button></div></div></div>;
+    <div className="bulk-list">{eligible.map(r=><label key={r.path}><input type="checkbox" checked={paths.includes(r.path)} onChange={e=>setPaths(p=>e.target.checked?[...p,r.path]:p.filter(x=>x!==r.path))}/><span className="bulk-repo">{r.name}</span><small>{action==='commit_push'?plural(r.files.length,'file'):r.upstream||r.remote}</small></label>)}{!eligible.length&&<div className="quiet-empty">No repositories need this action.</div>}</div>
+    <div className="dialog-actions"><button onClick={close}>Cancel</button><button className="primary-button" disabled={!paths.length||(action==='commit_push'&&!message.trim())} onClick={()=>start({paths,message,mode,includeUntracked:include})}>{title}</button></div></div></div>;
 }
 
-function SettingsModal({settings,save,close,addRepos,removeRepo,autoLayout,notify}:{settings:Settings;save:(s:Settings)=>Promise<void>;close:()=>void;addRepos:()=>void;removeRepo:(s:string)=>void;autoLayout:(layout:string)=>void;notify:(s:string)=>void}) {
+function BulkStatus({job,retry,dismiss}:{job:BulkJob;retry:()=>void;dismiss:()=>void}) {
+  const [expanded,setExpanded]=useState(false);
+  const failed=job.results.filter(r=>r.status==='failed').length;
+  const label=job.action==='commit_push'?'Commit & push':job.action==='fetch'?'Fetch':'Pull';
+  const summary=job.busy?`${job.completed} of ${job.pending} completed`:job.error?'Operation interrupted':failed?`${failed} failed · ${job.results.length-failed} completed`:`${job.results.length} completed`;
+  return <aside className="bulk-status" aria-label={`${label} status`}>
+    <div className="bulk-status-head"><span className={`bulk-status-icon ${job.busy?'spin':''}`}>{job.busy?<RefreshCw size={15}/>:failed||job.error?<X size={15}/>:<Check size={15}/>}</span><div><strong>{label} {job.busy?'in progress':job.error?'interrupted':'complete'}</strong><small role="status" aria-live="polite">{summary}</small></div>{!job.busy&&<button className="bulk-status-close" onClick={dismiss} aria-label="Dismiss operation status"><X size={14}/></button>}</div>
+    {job.busy&&<div className="bulk-status-track" role="progressbar" aria-valuemin={0} aria-valuemax={job.pending} aria-valuenow={job.completed}><span style={{width:`${job.pending?job.completed/job.pending*100:0}%`}}/></div>}
+    {job.error&&<p className="bulk-status-error">{job.error}</p>}
+    {(job.results.length>0||job.error)&&<div className="bulk-status-actions"><button onClick={()=>setExpanded(value=>!value)} aria-expanded={expanded}>{expanded?'Hide details':'Show details'} <ChevronDown size={13}/></button>{!job.busy&&failed>0&&<button onClick={retry}>Retry failed</button>}</div>}
+    {expanded&&<div className="bulk-status-results">{job.results.map(r=><div key={r.path}><strong title={r.path}>{nameOf(r.path)}</strong><span className={r.status}>{r.status}</span><small>{r.detail}</small></div>)}</div>}
+  </aside>;
+}
+
+function SettingsModal({settings,save,close,addRepos,removeRepo,autoLayout,notify,updater}:{settings:Settings;save:(s:Settings)=>Promise<void>;close:()=>void;addRepos:()=>void;removeRepo:(s:string)=>void;autoLayout:(layout:string)=>void;notify:(s:string)=>void;updater:Updater}) {
   const [gitVersion,setGitVersion]=useState('Checking…'),[connected,setConnected]=useState(false),[device,setDevice]=useState<DeviceCode|null>(null),[connecting,setConnecting]=useState(false);
   useEffect(()=>{api<string>('git_version').then(setGitVersion).catch(e=>setGitVersion(errText(e)));api<boolean>('github_connected').then(setConnected)},[]);
   const connect=async()=>{try{setConnecting(true);const code=await api<DeviceCode>('github_begin');setDevice(code);await openUrl(code.verificationUri);await api('github_finish',{code});setConnected(true);setDevice(null);notify('GitHub connected')}catch(e){notify(errText(e))}finally{setConnecting(false)}};
   return <div className="modal-backdrop"><div className="dialog settings-dialog"><button className="close" aria-label="Close" onClick={close}><X size={16}/></button><h2>Settings</h2><div className="settings-group"><h3>Repositories</h3>{settings.repos.map(r=><div className="settings-root" key={r}><Github size={15}/><span title={r}>{r}</span><button onClick={()=>removeRepo(r)} aria-label={`Stop tracking ${nameOf(r)}`} title="Remove from git-monitor; files stay on disk">Stop tracking</button></div>)}<button className="text-action" onClick={addRepos}><Plus size={14}/> Add repositories</button></div>
   <div className="settings-group"><h3>Canvas</h3><label>Layout<select value={settings.layout} onChange={e=>autoLayout(e.target.value)}><option value="horizontal">Horizontal</option><option value="tree">Tree</option><option value="radial">Radial</option></select></label><label>Appearance<select value={settings.appearance} onChange={e=>save({...settings,appearance:e.target.value})}><option value="light">Light</option><option value="dark">Dark</option><option value="system">System</option></select></label><label><input type="checkbox" checked={settings.grid} onChange={e=>save({...settings,grid:e.target.checked})}/> Show canvas dots</label><label><input type="checkbox" checked={settings.autoMonitor} onChange={e=>save({...settings,autoMonitor:e.target.checked})}/> Monitor file changes</label></div>
-  <div className="settings-group"><h3>Integrations</h3><div className="integration-row"><span><GitBranch size={15}/> Git <small>{gitVersion}</small></span></div><div className="integration-row"><span><Github size={15}/> GitHub <small>{connected?'Connected':'Not connected'}</small></span>{connected?<button onClick={async()=>{try{await api('github_disconnect');setConnected(false)}catch(e){notify(errText(e))}}}>Disconnect</button>:<button onClick={connect} disabled={connecting}>{connecting?'Connecting…':'Connect'}</button>}</div>{device&&<p className="device-code">Enter code <strong>{device.userCode}</strong> at GitHub in your browser.</p>}</div><div className="dialog-actions"><button className="primary-button" onClick={close}>Done</button></div></div></div>;
+  <div className="settings-group"><h3>Integrations</h3><div className="integration-row"><span><GitBranch size={15}/> Git <small>{gitVersion}</small></span></div><div className="integration-row"><span><Github size={15}/> GitHub <small>{connected?'Connected':'Not connected'}</small></span>{connected?<button onClick={async()=>{try{await api('github_disconnect');setConnected(false)}catch(e){notify(errText(e))}}}>Disconnect</button>:<button onClick={connect} disabled={connecting}>{connecting?'Connecting…':'Connect'}</button>}</div>{device&&<p className="device-code">Enter code <strong>{device.userCode}</strong> at GitHub in your browser.</p>}</div>
+  <div className="settings-group"><h3>App updates</h3><div className="integration-row"><span>git-monitor <small>{updater.version?`v${updater.version}`:'Checking version…'}</small></span><button onClick={()=>updater.checkForUpdates(true)} disabled={updater.phase==='checking'||updater.phase==='downloading'||updater.phase==='installing'}>{updater.phase==='checking'?'Checking…':'Check for updates'}</button></div>{updater.phase==='available'&&<div className="integration-row"><span>Version {updater.availableVersion} available</span><button onClick={updater.install}>Download and install</button></div>}{updater.message&&<p className={`update-message ${updater.phase==='error'?'failed':''}`} role="status">{updater.message}</p>}</div><div className="dialog-actions"><button className="primary-button" onClick={close}>Done</button></div></div></div>;
 }
 
 function SectionsModal({settings,save,close}:{settings:Settings;save:(s:Settings)=>Promise<void>;close:()=>void}) {

@@ -11,6 +11,7 @@ A native Tauri desktop application for monitoring local Git repositories on a co
 - Independent bulk commit/push, fetch, and pull with per-repository results and retry.
 - Local branch creation, switch, rename, safe deletion, publication, and recent history.
 - GitHub device sign-in with OS credential storage, pull request listing and creation, and the guarded “PR from Different Branch” workflow for uncommitted changes or local commits ahead of `origin/<target>`.
+- Signed in-app updates: git-monitor checks GitHub Releases on launch, offers an install button when a newer version exists, and has a manual check in Settings.
 
 ## Architecture
 
@@ -25,6 +26,10 @@ The tag-triggered [release workflow](.github/workflows/release.yml) builds:
 - `git-monitor-macOS-x64.dmg` on Intel macOS
 
 All three builds must succeed before the workflow creates a GitHub Release. A local Apple Silicon DMG is available at [`release/git-monitor-macOS-arm64.dmg`](release/git-monitor-macOS-arm64.dmg).
+
+Starting with v0.2.0, each release also contains signed updater packages and `latest.json`. The app checks that manifest on launch and verifies the package signature before installing. You can also use **Settings → App updates → Check for updates**. Existing v0.1.1 installations need to install v0.2.0 manually once, because that version has no updater.
+
+Release builds require a `TAURI_SIGNING_PRIVATE_KEY` Actions secret. The matching public key is in `src-tauri/tauri.conf.json`. Keep a secure backup of the private key: future updates must use the same key. The private key is never committed. To make a local signed bundle, set `TAURI_SIGNING_PRIVATE_KEY` to the private key file path or contents before running the Tauri build.
 
 The application uses an installed Git executable and its configured credential helper for remote Git authentication. Local monitoring works without GitHub sign-in. A build without a GitHub OAuth client ID shows a setup error when Connect GitHub is selected.
 
@@ -51,7 +56,7 @@ npm run dev
 
 `npm run dev` compiles and opens the native desktop app directly, without creating or downloading an installer. Keep the command running while testing: frontend edits reload in the app, and Rust changes rebuild and restart it. Press Ctrl+C to stop. `npm run desktop:dev` remains an alias. To run only the frontend in a browser, use `npm run frontend:dev`; native Git features require the desktop app.
 
-Run `npm run build` for the frontend, `cargo test --manifest-path src-tauri/Cargo.toml --lib` for Git service tests, and `npm run tauri -- build --bundles dmg` on macOS to create a local installer.
+Run `npm run build` for the frontend, `cargo test --manifest-path src-tauri/Cargo.toml --lib` for Git service tests, and `npm run tauri -- build --bundles app,dmg` on macOS to create a local installer and signed updater package.
 
 ## Current limits
 

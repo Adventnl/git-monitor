@@ -198,48 +198,97 @@ async fn commit_repo(
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct BulkRequest {
+    run_id: String,
     paths: Vec<String>,
     action: String,
     message: Option<String>,
     mode: Option<String>,
     include_untracked: Option<bool>,
+    committed_paths: Option<Vec<String>>,
 }
 #[tauri::command]
 async fn bulk_operation(app: AppHandle, request: BulkRequest) -> Vec<git::OpResult> {
-    let mut results = Vec::new();
     let total = request.paths.len();
-    for (index, path) in request.paths.iter().enumerate() {
-        let p = path.clone();
-        let action = request.action.clone();
-        let message = request.message.clone().unwrap_or_default();
-        let mode = request.mode.clone().unwrap_or_else(|| "all".into());
-        let include = request.include_untracked.unwrap_or(true);
-        let result = tauri::async_runtime::spawn_blocking(move || match action.as_str() {
-            "commit_push" => git::commit_push(&p, &message, &mode, include, true, false),
-            "fetch" => simple_op(&p, git::fetch(&p)),
-            "pull" => simple_op(&p, git::pull(&p)),
-            "push" => {
-                let mut r = simple_op(
-                    &p,
-                    git::git(&p, &["push"]).map(|_| "Pushed existing local commit".into()),
-                );
-                r.committed = true;
-                if r.status == "success" {
-                    r.pushed = true;
-                }
-                r
+    let mut results = vec![None; total];
+    let mut jobs = tokio::task::JoinSet::new();
+    let mut next = 0;
+    let mut completed = 0;
+    // Limit concurrent Git processes while allowing independent repositories to proceed.
+    while completed < total {
+        while next < total && jobs.len() < 4 {
+            let index = next;
+            let path = request.paths[index].clone();
+            let action = request.action.clone();
+            let message = request.message.clone().unwrap_or_default();
+            let mode = request.mode.clone().unwrap_or_else(|| "all".into());
+            let include = request.include_untracked.unwrap_or(true);
+            let already_committed = request
+                .committed_paths
+                .as_ref()
+                .is_some_and(|paths| paths.contains(&path));
+            jobs.spawn(async move {
+                let fallback = path.clone();
+                let result = tauri::async_runtime::spawn_blocking(move || {
+                    let mut result = match action.as_str() {
+                        "commit_push" if already_committed => {
+                            let mut r = simple_op(
+                                &path,
+                                git::git(&path, &["push"])
+                                    .map(|_| "Pushed existing local commit".into()),
+                            );
+                            r.committed = true;
+                            if r.status == "success" {
+                                r.pushed = true;
+                            }
+                            r
+                        }
+                        "commit_push" => {
+                            git::commit_push(&path, &message, &mode, include, true, false)
+                        }
+                        "fetch" => simple_op(&path, git::fetch(&path)),
+                        "pull" => simple_op(&path, git::pull(&path)),
+                        _ => simple_op(&path, Err("Unknown operation".into())),
+                    };
+                    if already_committed {
+                        result.committed = true;
+                    }
+                    result
+                })
+                .await
+                .unwrap_or_else(|e| simple_op(&fallback, Err(e.to_string())));
+                (index, result)
+            });
+            next += 1;
+        }
+        match jobs.join_next().await {
+            Some(Ok((index, result))) => {
+                completed += 1;
+                let _ = app.emit("bulk-progress", serde_json::json!({
+                    "runId": request.run_id, "index": completed, "total": total, "result": result
+                }));
+                results[index] = Some(result);
             }
-            _ => simple_op(&p, Err("Unknown operation".into())),
-        })
-        .await
-        .unwrap_or_else(|e| simple_op(path, Err(e.to_string())));
-        let _ = app.emit(
-            "bulk-progress",
-            serde_json::json!({"index":index+1,"total":total,"result":result}),
-        );
-        results.push(result);
+            Some(Err(_)) => {}
+            None => break,
+        }
     }
-    results
+    for (index, slot) in results.iter_mut().enumerate() {
+        if slot.is_none() {
+            completed += 1;
+            let result = simple_op(
+                &request.paths[index],
+                Err("Git operation ended unexpectedly".into()),
+            );
+            let _ = app.emit(
+                "bulk-progress",
+                serde_json::json!({
+                    "runId": request.run_id, "index": completed, "total": total, "result": result
+                }),
+            );
+            *slot = Some(result);
+        }
+    }
+    results.into_iter().flatten().collect()
 }
 fn simple_op(path: &str, value: Result<String, String>) -> git::OpResult {
     match value {
@@ -363,6 +412,8 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .setup(|app| {
             let file = app.path().app_config_dir()?.join("settings.json");
             let saved = fs::read(&file).ok().and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
