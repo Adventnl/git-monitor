@@ -33,6 +33,8 @@ Release builds require a `TAURI_SIGNING_PRIVATE_KEY` Actions secret. The matchin
 
 The application uses an installed Git executable and its configured credential helper for remote Git authentication. Local monitoring works without GitHub sign-in. A build without a GitHub OAuth client ID shows a setup error when Connect GitHub is selected.
 
+On Windows, all Git subprocesses use `CREATE_NO_WINDOW` so background checks and Git actions do not open command windows. Background inspection disables optional index writes, ignores read events and temporary Git lock/object events, and shares a queue of at most four repository inspections to prevent refresh storms. Real index and branch changes still trigger refreshes.
+
 ### Set up GitHub sign-in
 
 1. Open [GitHub Developer settings](https://github.com/settings/developers), choose **OAuth Apps** → **New OAuth App**, and register the app under the account that will maintain it.
@@ -56,7 +58,9 @@ npm run dev
 
 `npm run dev` compiles and opens the native desktop app directly, without creating or downloading an installer. Keep the command running while testing: frontend edits reload in the app, and Rust changes rebuild and restart it. Press Ctrl+C to stop. `npm run desktop:dev` remains an alias. To run only the frontend in a browser, use `npm run frontend:dev`; native Git features require the desktop app.
 
-Run `npm run build` for the frontend, `cargo test --manifest-path src-tauri/Cargo.toml --lib` for Git service tests, and `npm run tauri -- build --bundles app,dmg` on macOS to create a local installer and signed updater package.
+Run `npm test` (Node.js 22.6 or newer) for refresh queue and selection tests, `npm run build` for the frontend, `cargo test --manifest-path src-tauri/Cargo.toml --lib` for Git service and monitor tests, and `npm run tauri -- build --bundles app,dmg` on macOS to create a local installer and signed updater package.
+
+For browser regression tests, install the test browsers once with `npx playwright install chromium webkit`, then run `npm run test:ui`. These tests cover repeated selection, filtering, keyboard search, bulk operations and file-change bursts across 48 repositories. Native commands are mocked only in the tests; Chromium uses Windows paths and WebKit uses Mac paths and shortcuts. This does not replace testing a packaged app on macOS.
 
 ## Current limits
 

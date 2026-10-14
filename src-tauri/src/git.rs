@@ -40,9 +40,20 @@ pub struct OpResult {
 }
 
 fn output(path: &str, args: &[&str]) -> Result<Output, String> {
-    Command::new("git").arg("-C").arg(path).args(args)
-        .env("GIT_TERMINAL_PROMPT", "0").output()
-        .map_err(|e| format!("Could not run Git: {e}. Install Git or choose its executable in your system settings."))
+    let mut command = Command::new("git");
+    command.arg("-C").arg(path).args(args)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        // Status is a background read: writing the index would trigger our watcher
+        // again and can contend with an explicit stage/commit operation.
+        .env("GIT_OPTIONAL_LOCKS", "0");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command.output()
+        .map_err(|e| format!("Could not run Git: {e}. Install Git and make sure git is available on PATH, then restart Git Monitor."))
 }
 pub fn git(path: &str, args: &[&str]) -> Result<String, String> {
     let out = output(path, args)?;
@@ -515,6 +526,62 @@ mod tests {
         let (root, p) = fixture();
         fs::write(Path::new(&p).join("tracked.txt"), "changed\n").unwrap();
         assert!(pull(&p).unwrap_err().contains("working tree has changes"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn repeated_inspections_do_not_write_the_index() {
+        let (root, p) = fixture();
+        let index = Path::new(&p).join(".git/index");
+        let before = fs::read(&index).unwrap();
+        let modified = fs::metadata(&index).unwrap().modified().unwrap();
+        // A changed timestamp with identical content normally makes status
+        // refresh the cached stat data in the index.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        fs::write(Path::new(&p).join("tracked.txt"), "first\n").unwrap();
+        for _ in 0..5 {
+            assert!(repo(&p).unwrap().files.is_empty());
+        }
+        assert_eq!(fs::read(&index).unwrap(), before);
+        assert_eq!(fs::metadata(&index).unwrap().modified().unwrap(), modified);
+        assert!(!Path::new(&p).join(".git/index.lock").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn commit_push_fetch_and_pull_with_stored_repository_paths() {
+        let (root, p) = fixture();
+        // Exercise exactly the paths saved by the folder picker (including
+        // Windows' verbatim prefix), rather than only ordinary test paths.
+        let p = validate_repo_root(&p).unwrap();
+        git(&p, &["branch", "-M", "main"]).unwrap();
+        let remote = root.join("remote with spaces.git");
+        fs::create_dir_all(&remote).unwrap();
+        git(remote.to_str().unwrap(), &["init", "--bare", "-q"]).unwrap();
+        git(&p, &["remote", "add", "origin", remote.to_str().unwrap()]).unwrap();
+        git(&p, &["push", "-u", "origin", "main"]).unwrap();
+
+        let peer = root.join("peer with spaces");
+        git(root.to_str().unwrap(), &["clone", "-q", "--branch", "main", remote.to_str().unwrap(), peer.to_str().unwrap()]).unwrap();
+        let peer = validate_repo_root(peer.to_str().unwrap()).unwrap();
+        git(&peer, &["config", "user.email", "test@example.invalid"]).unwrap();
+        git(&peer, &["config", "user.name", "Test"]).unwrap();
+        fs::write(Path::new(&peer).join("remote.txt"), "remote update\n").unwrap();
+        let published = commit_push(&peer, "Remote update", "all", true, true, false);
+        assert_eq!(published.status, "success", "{}", published.detail);
+        assert!(published.committed && published.pushed);
+        assert_eq!(fetch(&p).unwrap(), "Fetched");
+        assert_eq!(repo(&p).unwrap().behind, 1);
+        assert_eq!(pull(&p).unwrap(), "Fast-forwarded");
+        assert_eq!(fs::read_to_string(Path::new(&p).join("remote.txt")).unwrap().trim_end(), "remote update");
+
+        fs::write(Path::new(&p).join("local.txt"), "local update\n").unwrap();
+        let published = commit_push(&p, "Local update", "all", true, true, false);
+        assert_eq!(published.status, "success", "{}", published.detail);
+        assert!(published.committed && published.pushed);
+        assert!(repo(&p).unwrap().files.is_empty());
+        assert_eq!(pull(&peer).unwrap(), "Fast-forwarded");
+        assert!(Path::new(&peer).join("local.txt").exists());
         fs::remove_dir_all(root).unwrap();
     }
 }

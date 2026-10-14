@@ -1,5 +1,6 @@
 mod git;
 mod github;
+mod monitor;
 
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
@@ -67,15 +68,17 @@ fn watch(app: &AppHandle, state: &AppState) -> Result<(), String> {
     }
     for root in settings.repos {
         let handle = app.clone();
+        let changed_root = root.clone();
         let mut watcher =
             notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
                 if let Ok(event) = event {
-                    for path in event.paths {
-                        let s = path.to_string_lossy();
-                        if s.contains("/.git/objects/") || s.contains("\\.git\\objects\\") {
-                            continue;
-                        }
-                        let _ = handle.emit("git-changed", s.to_string());
+                    if !monitor::is_change(event.kind) {
+                        return;
+                    }
+                    if event.paths.iter().any(|path| !monitor::is_git_noise(path)) {
+                        // Use the tracked spelling of the root. Windows watcher
+                        // paths can differ in case, separators, and UNC prefix.
+                        let _ = handle.emit("git-changed", &changed_root);
                     }
                 }
             })

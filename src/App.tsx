@@ -7,6 +7,8 @@ import { open as chooseFolder } from '@tauri-apps/plugin-dialog';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { useUpdater, type Updater } from './useUpdater';
+import { createRepoInspector } from './repoInspector';
+import { applyNodeSelection } from './nodeSelection';
 import { Folder, GitBranch, Github, MoreHorizontal, Plus, RefreshCw, Settings2, Search, X, Minus, Maximize2, ChevronDown, GitPullRequest, ArrowUp, ArrowDown, Check, FileText, GitCommitHorizontal, History, PanelRightClose } from 'lucide-react';
 
 type FileChange = { path:string; status:string; staged:boolean; unstaged:boolean };
@@ -25,6 +27,7 @@ const errText = (e:unknown) => typeof e === 'string' ? e : e instanceof Error ? 
 const nameOf = (path:string) => path.split(/[\\/]/).filter(Boolean).at(-1) || path;
 const plural = (n:number, word:string) => `${n} ${n===1?word:word==='repository'?'repositories':`${word}s`}`;
 const api = <T,>(command:string,args?:Record<string,unknown>) => invoke<T>(command,args);
+const inspectRepo = createRepoInspector((path:string) => api<Repo>('inspect_repo',{path}));
 
 function CanvasNode({data}:NodeProps<Node<NodeData>>) {
   return <div className={`canvas-node repo-node ${data.error?'node-error':''}`}>
@@ -73,23 +76,23 @@ export default function App() {
     const generation=trackingGeneration.current;
     try{const saved=await api<Settings>('update_settings',{settings:next});if(generation===trackingGeneration.current){setSettings(saved);settingsRef.current=saved}}catch(e){notify(errText(e))}
   };
-  const refreshRepo=useCallback(async (path:string)=>{try{const r=await api<Repo>('inspect_repo',{path});if(settingsRef.current.repos.includes(path))setRepos(prev=>prev.map(item=>item.path===path?r:item))}catch(e){if(settingsRef.current.repos.includes(path))setRepos(prev=>prev.map(item=>item.path===path?{...item,error:errText(e)}:item))}},[]);
+  const refreshRepo=useCallback(async (path:string)=>{try{const r=await inspectRepo(path,true);if(settingsRef.current.repos.includes(path))setRepos(prev=>prev.map(item=>item.path===path?r:item))}catch(e){if(settingsRef.current.repos.includes(path))setRepos(prev=>prev.map(item=>item.path===path?{...item,error:errText(e)}:item))}},[]);
   const refreshAll=useCallback(async (paths?:string[])=>{
     const generation=++refreshGeneration.current;
     const targets=paths||settingsRef.current.repos;
     setLoading(true);
-    const found=await Promise.all(targets.map(async path=>{try{return await api<Repo>('inspect_repo',{path})}catch(e){return {path,name:nameOf(path),branch:'—',kind:'repository',files:[],ahead:0,behind:0,upstream:null,remote:null,error:errText(e)} as Repo}}));
+    const found=await Promise.all(targets.map(async path=>{try{return await inspectRepo(path,true)}catch(e){return {path,name:nameOf(path),branch:'—',kind:'repository',files:[],ahead:0,behind:0,upstream:null,remote:null,error:errText(e)} as Repo}}));
     if(generation!==refreshGeneration.current)return;
     setRepos(found.filter(repo=>settingsRef.current.repos.includes(repo.path)));setLoading(false);
   },[]);
   useEffect(()=>{if(!('__TAURI_INTERNALS__' in window))return;api<Settings>('get_settings').then(s=>{setSettings(s);settingsRef.current=s;setSettingsLoaded(true);refreshAll(s.repos)}).catch(e=>notify(errText(e)))},[refreshAll]);
-  useEffect(()=>{if(!('__TAURI_INTERNALS__' in window))return;let a:(()=>void)|undefined,b:(()=>void)|undefined;let timer:number|undefined;const pending=new Set<string>();
-    listen<string>('git-changed',e=>{pending.add(e.payload);window.clearTimeout(timer);timer=window.setTimeout(()=>{const changed=[...pending];pending.clear();const paths=new Set<string>();for(const path of changed){reposRef.current.filter(r=>path===r.path||path.startsWith(r.path+'/')||path.startsWith(r.path+'\\')).forEach(r=>paths.add(r.path))}paths.forEach(refreshRepo)},500)}).then(fn=>a=fn);
+  useEffect(()=>{if(!('__TAURI_INTERNALS__' in window))return;let disposed=false;let a:(()=>void)|undefined,b:(()=>void)|undefined;let timer:number|undefined;const pending=new Set<string>();
+    listen<string>('git-changed',e=>{if(disposed)return;pending.add(e.payload);window.clearTimeout(timer);timer=window.setTimeout(()=>{const changed=[...pending];pending.clear();const paths=new Set<string>();for(const path of changed){reposRef.current.filter(r=>path===r.path||path.startsWith(r.path+'/')||path.startsWith(r.path+'\\')).forEach(r=>paths.add(r.path))}paths.forEach(refreshRepo)},500)}).then(fn=>{if(disposed)fn();else a=fn});
     listen<{runId:string;index:number;total:number;result:OpResult}>('bulk-progress',e=>{
-      if(e.payload.runId!==bulkRunId.current)return;
+      if(disposed||e.payload.runId!==bulkRunId.current)return;
       setBulkJob(previous=>previous?{...previous,completed:e.payload.index,results:[...previous.results.filter(r=>r.path!==e.payload.result.path),e.payload.result]}:previous);
-    }).then(fn=>b=fn);
-    return()=>{a?.();b?.();window.clearTimeout(timer)};
+    }).then(fn=>{if(disposed)fn();else b=fn});
+    return()=>{disposed=true;a?.();b?.();window.clearTimeout(timer)};
   },[refreshRepo]);
   const addPaths=async(paths:string[])=>{const added:string[]=[];const errors:string[]=[];for(const path of paths){try{const s=await api<Settings>('add_repos',{paths:[path]});trackingGeneration.current++;setSettings(s);settingsRef.current=s;added.push(path)}catch(e){errors.push(`${nameOf(path)}: ${errText(e)}`)}}if(added.length)await refreshAll();if(errors.length)notify(errors.join(' · '));else if(added.length)notify(`${plural(added.length,'repository')} added`)};
   const addRepos=async()=>{try{const chosen=await chooseFolder({directory:true,multiple:true,title:'Select Git repository folders'});if(!chosen)return;await addPaths(Array.isArray(chosen)?chosen:[chosen])}catch(e){notify(errText(e))}};
@@ -143,16 +146,19 @@ export default function App() {
     saveSettings({...settingsRef.current,layout,positions});window.setTimeout(()=>fitCanvas(currentRepos,positions,350),120);
   },[]);
   useEffect(()=>{setNodes(previousNodes=>{
-    // React Flow hides nodes without dimensions; keep measurements when settings change.
-    const measuredByPath=new Map(previousNodes.map(node=>[node.id,node.measured]));
+    // Keep React Flow's measurements and interaction state when repository data changes.
+    const previousByPath=new Map(previousNodes.map(node=>[node.id,node]));
+    const selection=new Set(selectedPaths);
     return visibleRepos.map((repo,i)=>{
       const pos=settings.positions[repo.path]||[230+(i%4)*220,180+Math.floor(i/4)*105];
-      return {id:repo.path,type:'canvas',position:{x:pos[0],y:pos[1]},measured:measuredByPath.get(repo.path),data:{title:repo.name,subtitle:repo.branch,count:repo.files.length,dirty:repo.files.length>0,ahead:repo.ahead,behind:repo.behind,error:repo.error||undefined,kind:repo.kind},selected:selected===repo.path||selectedPaths.includes(repo.path)};
+      return {...previousByPath.get(repo.path),id:repo.path,type:'canvas',position:{x:pos[0],y:pos[1]},data:{title:repo.name,subtitle:repo.branch,count:repo.files.length,dirty:repo.files.length>0,ahead:repo.ahead,behind:repo.behind,error:repo.error||undefined,kind:repo.kind},selected:selection.has(repo.path)};
     });
-  })},[visibleRepos,settings.positions,selected,selectedPaths]);
+  })},[visibleRepos,settings.positions,selectedPaths]);
   const edges=useMemo<Edge[]>(()=>[],[]);
-  const onNodesChange=(changes:NodeChange<Node<NodeData>>[])=>setNodes(prev=>applyNodeChanges(changes,prev));
-  const onSelectionChange=useCallback(({nodes:chosen}:{nodes:Node<NodeData>[]})=>{const next=chosen.map(n=>n.id);setSelectedPaths(old=>old.length===next.length&&old.every((path,i)=>path===next[i])?old:next)},[]);
+  const onNodesChange=useCallback((changes:NodeChange<Node<NodeData>>[])=>{
+    setNodes(prev=>applyNodeChanges(changes,prev));
+    setSelectedPaths(prev=>applyNodeSelection(changes,prev));
+  },[]);
   const persistPositions=()=>{const positions={...settingsRef.current.positions};nodes.forEach(n=>positions[n.id]=[n.position.x,n.position.y]);saveSettings({...settingsRef.current,positions})};
   const activeRepo=repos.find(r=>r.path===selected)||null;
   const scopedRepos=useMemo(()=>selectedPaths.length?visibleRepos.filter(r=>selectedPaths.includes(r.path)):visibleRepos,[selectedPaths,visibleRepos]);
@@ -188,9 +194,9 @@ export default function App() {
       <div className="top-actions">{selectedPaths.length>0&&<span className="selection-count">{plural(selectedPaths.length,'selected')}</span>}<button className="round-action" aria-label="Refresh visible repositories" title="Refresh" onClick={()=>refreshAll()}><RefreshCw size={15} className={loading?'spin':''}/></button><button className="commit-all" onClick={()=>launchBulk('commit_push')}><ArrowUp size={15}/> {selectedPaths.length?'Commit & Push Selected':'Commit & Push All'}</button><div className="menu-wrap"><button className="round-action" aria-label="More actions" onClick={()=>setMenu(!menu)}><MoreHorizontal size={19}/></button>{menu&&<div className="action-menu">
         <button onClick={()=>launchBulk('commit_push')}>Commit & Push {selectedPaths.length?'Selected':'All'}</button><button onClick={()=>launchBulk('fetch')}>Fetch {selectedPaths.length?'Selected':'All'}</button><button onClick={()=>launchBulk('pull')}>Pull {selectedPaths.length?'Selected':'All'}</button><hr/><button onClick={()=>{setSelectedPaths(visibleRepos.map(r=>r.path));setMenu(false)}}>Select all visible</button><button onClick={()=>{setSelectedPaths(visibleRepos.filter(r=>r.files.length).map(r=>r.path));setMenu(false)}}>Select changed</button><button onClick={()=>{setSelectedPaths([]);setMenu(false)}}>Deselect all</button><hr/><button onClick={()=>{setModal('sections');setMenu(false)}}>Organize sections</button><button onClick={()=>{addRepos();setMenu(false)}}>Add repositories</button><button onClick={()=>{autoLayout();setMenu(false)}}>Auto Layout</button><button onClick={()=>{fitCanvas();setMenu(false)}}>Fit Canvas</button><hr/><button onClick={()=>{setModal('settings');setMenu(false)}}>Settings</button>
       </div>}</div></div>
-      <div className="flow-wrap" ref={flowWrap}><ReactFlow nodes={nodes} edges={edges} nodeTypes={nodeTypes} onInit={i=>{flow.current=i;setFlowReady(true)}} onNodesChange={onNodesChange} onNodeDragStop={persistPositions} onSelectionChange={onSelectionChange} onNodeClick={(_,n)=>setSelected(n.id)}       onPaneClick={()=>{setSelected(null);setSelectedPaths([])}} onMoveEnd={(_,v)=>{if(!canvasReady.current)return;const nextViewport=[v.x,v.y,v.zoom] as [number,number,number];const old=settingsRef.current; if(!isViewportSame(old.viewport,nextViewport))saveSettings({...old,viewport:nextViewport})}} proOptions={{hideAttribution:true}} minZoom={0.05} maxZoom={1.6} selectionOnDrag multiSelectionKeyCode="Shift" panOnDrag><Background variant={BackgroundVariant.Dots} gap={18} size={0.7} color={settings.grid?'#dde4ee':'transparent'}/><Controls showInteractive={false} onFitView={()=>fitCanvas()} className="canvas-controls"/></ReactFlow>{visibleRepos.length===0&&<div className="section-empty"><Folder size={22}/><strong>No repositories in this section</strong><span>Use Organize to add repositories here.</span><button className="secondary-button" onClick={()=>setModal('sections')}>Organize repositories</button></div>}</div>    </>}
+      <div className="flow-wrap" ref={flowWrap}><ReactFlow nodes={nodes} edges={edges} nodeTypes={nodeTypes} onInit={i=>{flow.current=i;setFlowReady(true)}} onNodesChange={onNodesChange} onNodeDragStop={persistPositions} onNodeClick={(_,n)=>setSelected(n.id)}       onPaneClick={()=>{setSelected(null);setSelectedPaths([])}} onMoveEnd={(_,v)=>{if(!canvasReady.current)return;const nextViewport=[v.x,v.y,v.zoom] as [number,number,number];const old=settingsRef.current; if(!isViewportSame(old.viewport,nextViewport))saveSettings({...old,viewport:nextViewport})}} proOptions={{hideAttribution:true}} minZoom={0.05} maxZoom={1.6} selectionOnDrag multiSelectionKeyCode="Shift" panOnDrag><Background variant={BackgroundVariant.Dots} gap={18} size={0.7} color={settings.grid?'#dde4ee':'transparent'}/><Controls showInteractive={false} onFitView={()=>fitCanvas()} className="canvas-controls"/></ReactFlow>{visibleRepos.length===0&&<div className="section-empty"><Folder size={22}/><strong>No repositories in this section</strong><span>Use Organize to add repositories here.</span><button className="secondary-button" onClick={()=>setModal('sections')}>Organize repositories</button></div>}</div>    </>}
     {activeRepo&&<Inspector repo={activeRepo} refresh={()=>refreshRepo(activeRepo.path)} close={()=>setSelected(null)} remove={()=>removeRepo(activeRepo.path)} notify={notify} pull={()=>{if(bulkJobRef.current?.busy){notify('Wait for the current operation to finish');return}setSelected(null);runBulk('pull',{paths:[activeRepo.path],message:'',mode:'all',includeUntracked:true})}} openTransfer={()=>{setModal('transfer')}} openPr={()=>setModal('pr')}/>}
-    {searchOpen&&<div className="search-overlay"><div className="search-dialog"><div className="search-input"><Search size={17}/><input autoFocus placeholder="Find a repository…" value={search} onChange={e=>setSearch(e.target.value)}/><button onClick={()=>setSearchOpen(false)}><X size={15}/></button></div><div className="search-results">{repos.filter(r=>r.name.toLowerCase().includes(search.toLowerCase())).slice(0,30).map(r=><button key={r.path} onClick={()=>{selectSection(null);setSelected(r.path);setSearchOpen(false);flow.current?.setCenter(settings.positions[r.path]?.[0]||230,settings.positions[r.path]?.[1]||180,{zoom:1,duration:300})}}><Github size={15}/><span>{r.name}</span><small>{sectionFor(r.path)?.name||'Ungrouped'}</small></button>)}</div></div></div>}
+    {searchOpen&&<div className="search-overlay"><div className="search-dialog"><div className="search-input"><Search size={17}/><input autoFocus placeholder="Find a repository…" value={search} onChange={e=>setSearch(e.target.value)}/><button onClick={()=>setSearchOpen(false)}><X size={15}/></button></div><div className="search-results">{repos.filter(r=>r.name.toLowerCase().includes(search.toLowerCase())).slice(0,30).map(r=><button key={r.path} onClick={()=>{selectSection(null);setSelected(r.path);setSelectedPaths([r.path]);setSearchOpen(false);flow.current?.setCenter(settings.positions[r.path]?.[0]||230,settings.positions[r.path]?.[1]||180,{zoom:1,duration:300})}}><Github size={15}/><span>{r.name}</span><small>{sectionFor(r.path)?.name||'Ungrouped'}</small></button>)}</div></div></div>}
     {modal==='bulk'&&<BulkModal action={bulkAction} repos={scopedRepos} close={()=>setModal(null)} start={options=>runBulk(bulkAction,options)}/>}
     {modal==='settings'&&<SettingsModal settings={settings} save={saveSettings} close={()=>setModal(null)} addRepos={addRepos} removeRepo={removeRepo} autoLayout={autoLayout} notify={notify} updater={updater}/>}
     {modal==='sections'&&<SectionsModal settings={settings} save={saveSettings} close={()=>setModal(null)} />}
@@ -228,11 +234,11 @@ function Inspector({repo,refresh,close,remove,notify,pull,openTransfer,openPr}:{
 
 function BulkModal({action,repos,close,start}:{action:BulkAction;repos:Repo[];close:()=>void;start:(options:BulkOptions)=>void}) {
   const eligible=useMemo(()=>repos.filter(r=>action==='commit_push'?r.files.length>0:action==='fetch'?!!r.remote:!!r.upstream&&r.behind>0),[repos,action]);
-  const [paths,setPaths]=useState<string[]>(eligible.map(r=>r.path)),[message,setMessage]=useState(''),[mode,setMode]=useState('all'),[include,setInclude]=useState(true);
-  useEffect(()=>setPaths(eligible.map(r=>r.path)),[eligible]);
+  const [excludedPaths,setExcludedPaths]=useState<string[]>([]),[message,setMessage]=useState(''),[mode,setMode]=useState('all'),[include,setInclude]=useState(true);
+  const paths=eligible.filter(repo=>!excludedPaths.includes(repo.path)).map(repo=>repo.path);
   const title=action==='commit_push'?'Commit & Push All':action==='fetch'?'Fetch All':'Pull All';
   return <div className="modal-backdrop"><div className="dialog bulk-dialog"><button className="close" aria-label="Close" onClick={close}><X size={16}/></button><h2>{title}</h2><p>{action==='commit_push'?'Each selected repository receives its own commit and push.':action==='fetch'?'Download remote updates without changing working files.':'Only branches that can fast-forward safely will update.'}</p>{action==='commit_push'&&<><input className="dialog-input" placeholder="Commit message" value={message} onChange={e=>setMessage(e.target.value)}/><div className="bulk-options"><select value={mode} onChange={e=>setMode(e.target.value)}><option value="all">Commit all changes</option><option value="tracked">Commit tracked changes</option><option value="staged">Staged only</option></select><label><input type="checkbox" checked={include} onChange={e=>setInclude(e.target.checked)} disabled={mode!=='all'}/> Include untracked files</label></div></>}
-    <div className="bulk-list">{eligible.map(r=><label key={r.path}><input type="checkbox" checked={paths.includes(r.path)} onChange={e=>setPaths(p=>e.target.checked?[...p,r.path]:p.filter(x=>x!==r.path))}/><span className="bulk-repo">{r.name}</span><small>{action==='commit_push'?plural(r.files.length,'file'):r.upstream||r.remote}</small></label>)}{!eligible.length&&<div className="quiet-empty">No repositories need this action.</div>}</div>
+    <div className="bulk-list">{eligible.map(r=><label key={r.path}><input type="checkbox" checked={paths.includes(r.path)} onChange={e=>setExcludedPaths(p=>e.target.checked?p.filter(x=>x!==r.path):[...p,r.path])}/><span className="bulk-repo">{r.name}</span><small>{action==='commit_push'?plural(r.files.length,'file'):r.upstream||r.remote}</small></label>)}{!eligible.length&&<div className="quiet-empty">No repositories need this action.</div>}</div>
     <div className="dialog-actions"><button onClick={close}>Cancel</button><button className="primary-button" disabled={!paths.length||(action==='commit_push'&&!message.trim())} onClick={()=>start({paths,message,mode,includeUntracked:include})}>{title}</button></div></div></div>;
 }
 
