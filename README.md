@@ -19,6 +19,12 @@ A native Tauri desktop application for monitoring local Git repositories on a co
 
 ## Installers
 
+### Windows fix in v0.2.1
+
+The v0.2.0 release predates the Windows console-window and repository refresh-loop fixes. v0.2.1 includes them: background Git commands run without console windows, inspections avoid index writes that retrigger monitoring, and repository refreshes share a bounded queue. Running the current source locally does not update an already published installer.
+
+For maintainers, publishing v0.2.1 requires committing the version changes and pushing the `v0.2.1` tag. Running the workflow manually only produces build artifacts; the publish job runs on version tags. Existing v0.2.0 installations can update when the new release is published, or install its Windows setup executable directly.
+
 The tag-triggered [release workflow](.github/workflows/release.yml) builds:
 
 - `git-monitor-Setup-x64.exe` on Windows (NSIS)
